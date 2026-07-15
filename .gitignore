@@ -1,0 +1,32 @@
+# --- Secrets & credentials (NEVER commit) ---
+.env
+.env.*
+*.env
+secrets.*
+*token*.txt
+mcp_access_token*
+GARMIN_TOKEN_BASE64*
+
+# Garmin OAuth token caches
+.garminconnect/
+.garminconnect_base64
+**/.garminconnect/
+**/.garminconnect_base64
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# --- Editor / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- Logs ---
+*.log

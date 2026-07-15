@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# Environments
+.venv/
+.env
+.env.*
+
+# VCS
+.git/
+.gitignore
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Node
+node_modules/
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+
+# Tokens/cache
+**/.garminconnect/
+**/.garminconnect_base64
+

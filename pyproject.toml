@@ -1,0 +1,27 @@
+[build-system]
+requires = [ "hatchling",]
+build-backend = "hatchling.build"
+
+[project]
+name = "garmin-mcp"
+version = "0.1.0"
+description = "MCP server to access Garmin data (Streamable HTTP + bearer auth)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "python-dotenv==1.0.1",
+    "garminconnect==0.2.25",
+    "requests==2.32.3",
+    "mcp>=1.9.0,<2.0.0",
+    "garth==0.5.2",
+    "uvicorn>=0.30",
+    "starlette>=0.37",
+]
+
+[project.scripts]
+garmin-mcp = "garmin_mcp:main"
+garmin-mcp-http = "garmin_mcp.http_server:serve"
+garmin-mcp-mint = "garmin_mcp.mint:main"
+
+[tool.uv.sources]
+garmin-mcp = { workspace = true }
