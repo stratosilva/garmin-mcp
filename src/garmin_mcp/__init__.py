@@ -18,8 +18,8 @@ import sys
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from garth.exc import GarthHTTPError
 from garminconnect import Garmin, GarminConnectAuthenticationError
+from garminconnect.exceptions import GarminConnectConnectionError
 
 # Import all tool modules
 from garmin_mcp import activity_management
@@ -103,18 +103,18 @@ def get_mfa() -> str:
     )
 
 
-# Credentials / token sources from environment
+# Credentials and the one-time native token bootstrap from environment.
+# The durable token store always lives on the Railway volume.
 email = os.environ.get("GARMIN_EMAIL")
 password = os.environ.get("GARMIN_PASSWORD")
 TOKENSTORE_DIR = os.path.expanduser(os.getenv("GARMINTOKENS") or "~/.garminconnect")
-TOKEN_BASE64 = os.getenv("GARMIN_TOKEN_BASE64") or os.getenv("GARMINTOKENS_BASE64")
+TOKEN_JSON = os.getenv("GARMIN_TOKEN_JSON")
 
 
 def _persist_tokens(garmin):
-    """Persist OAuth tokens to the token directory (the Railway volume)."""
+    """Persist native DI OAuth tokens to the Railway volume."""
     try:
-        os.makedirs(TOKENSTORE_DIR, exist_ok=True)
-        garmin.garth.dump(TOKENSTORE_DIR)
+        garmin.client.dump(TOKENSTORE_DIR)
         _log(f"OAuth tokens persisted to '{TOKENSTORE_DIR}'.")
     except Exception as e:  # noqa: BLE001 - best effort
         _log(f"Warning: could not persist tokens to '{TOKENSTORE_DIR}': {e}")
@@ -123,38 +123,32 @@ def _persist_tokens(garmin):
 def init_api(email, password):
     """Initialise the Garmin API client.
 
-    Order of preference (fewest network handshakes first, so a fingerprint-
-    sensitive full login is the last resort):
-      1. base64 token blob (GARMIN_TOKEN_BASE64) - no login handshake.
-      2. cached tokens in the token directory / persistent volume.
-      3. email + password (+ MFA) full login.
+    The current garminconnect client automatically refreshes its native DI OAuth
+    token before requests.  We prefer its refreshed token on the persistent
+    volume, using GARMIN_TOKEN_JSON only to bootstrap a new volume.
     """
-    # 1) base64 token blob (recommended for cloud deploys)
-    if TOKEN_BASE64 and len(TOKEN_BASE64) > 512:
+    # 1) Durable native token store on Railway's mounted volume.
+    try:
+        _log(f"Loading Garmin tokens from '{TOKENSTORE_DIR}'...")
+        garmin = Garmin()
+        garmin.login(TOKENSTORE_DIR)
+        return garmin
+    except (FileNotFoundError, GarminConnectAuthenticationError,
+            GarminConnectConnectionError, KeyError, ValueError) as exc:
+        _log(f"No usable persisted Garmin tokens ({type(exc).__name__}: {exc}).")
+
+    # 2) One-time inline bootstrap, saved immediately to the persistent volume.
+    if TOKEN_JSON:
         try:
-            _log("Logging in to Garmin using the provided base64 token blob...")
+            _log("Bootstrapping Garmin tokens from the supplied secure token...")
             garmin = Garmin()
-            garmin.login(TOKEN_BASE64)  # >512 chars -> garth.loads()
+            garmin.login(TOKEN_JSON)
             _persist_tokens(garmin)
             return garmin
         except Exception as e:  # noqa: BLE001
-            _log(f"Base64 token login failed, will try other methods: {e}")
+            _log(f"Secure token bootstrap failed: {e}")
 
-    # 2) cached tokens on disk (persistent volume)
-    try:
-        _log(f"Logging in to Garmin using cached tokens in '{TOKENSTORE_DIR}'...")
-        garmin = Garmin()
-        garmin.login(TOKENSTORE_DIR)  # short path -> garth.load(dir)
-        return garmin
-    except (
-        FileNotFoundError,
-        GarthHTTPError,
-        GarminConnectAuthenticationError,
-        KeyError,
-    ) as e:
-        _log(f"No usable cached tokens ({type(e).__name__}: {e}).")
-
-    # 3) full credential login (requires an un-fingerprinted source IP)
+    # 3) Full credential login is a development fallback only.
     if not email or not password:
         _log(
             "No cached tokens and GARMIN_EMAIL/GARMIN_PASSWORD are not set; "
@@ -166,22 +160,12 @@ def init_api(email, password):
         garmin = Garmin(
             email=email, password=password, is_cn=False, prompt_mfa=get_mfa
         )
-        garmin.login()
-        _persist_tokens(garmin)
-        try:
-            blob = garmin.garth.dumps()
-            _log(
-                "\n===== GARMIN_TOKEN_BASE64 (store as a secret to skip future "
-                "logins/MFA) =====\n" + blob +
-                "\n===== end GARMIN_TOKEN_BASE64 =====\n"
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        garmin.login(TOKENSTORE_DIR)
         return garmin
     except (
         FileNotFoundError,
-        GarthHTTPError,
         GarminConnectAuthenticationError,
+        GarminConnectConnectionError,
         requests.exceptions.HTTPError,
     ) as err:
         _log(f"Garmin login failed: {err}")

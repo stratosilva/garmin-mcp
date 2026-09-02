@@ -56,6 +56,25 @@ set four variables → generate a domain → add to Claude.
 | `GARMIN_EMAIL` / `GARMIN_PASSWORD` | Fallback | Full login if no token blob; may trigger MFA |
 | `PORT` | Auto | Injected by Railway; the server binds it |
 | `DASHBOARD_TZ_OFFSET_HOURS` | Optional | Local-day offset for the dashboard (default `5.5` = IST) |
+| `OPENAI_API_KEY` | Optional | Server-side OpenAI API key for the personalised 24–48h dashboard recommendation |
+| `OPENAI_RECOMMENDATION_MODEL` | Optional | Model used for that recommendation (default `gpt-5-mini`) |
+
+### Personalised dashboard recommendation
+
+When `OPENAI_API_KEY` is configured, the dashboard's summary line is replaced
+with a concise next-24–48-hour recommendation. One recommendation is generated
+and saved per dashboard day, so ordinary page refreshes reuse it without making
+another model request. Use **Refresh advice** after logging meaningful new data
+(for example, a workout, sleep, or pain score) to explicitly request a new one.
+The browser sends the current dashboard snapshot to the protected server; the
+server reduces it to recovery, fitness, body-composition and latest pain signals
+before making the OpenAI API request. The API key is never sent to or stored in
+the browser.
+
+Create an API key in the OpenAI Platform and set it as a Railway environment
+variable. ChatGPT subscriptions and API billing are managed separately. If the
+key is absent or the service is unavailable, the existing rule-based coaching
+cue remains in place.
 
 See **[SETUP.md](SETUP.md)** for the full list, token rotation, and re-auth.
 

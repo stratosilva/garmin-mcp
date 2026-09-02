@@ -11,8 +11,9 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 
-# Install dependencies and the project (no dev deps), against the locked versions
-RUN uv sync --frozen --no-dev
+# Install dependencies and the project (no dev deps). The build resolves the
+# current GarminConnect native-auth dependency when the checked-in lock changes.
+RUN uv sync --no-dev
 
 # Garmin OAuth tokens live at /root/.garminconnect. On Railway, attach a
 # persistent volume mounted at that path (railway volume add --mount-path
@@ -26,7 +27,7 @@ EXPOSE 8000
 
 # Runtime environment variables (set on Railway, never baked into the image):
 #   MCP_ACCESS_TOKEN   (required) bearer token guarding /mcp
-#   GARMIN_TOKEN_BASE64 (recommended) base64 OAuth blob -> no login from server IP
+#   GARMIN_TOKEN_JSON (one-time secure bootstrap for the native token store)
 #   GARMIN_EMAIL / GARMIN_PASSWORD  (fallback) full login; may trigger MFA
 #   GARMIN_MFA_CODE / GARMIN_MFA_WAIT_SECONDS  (optional) non-interactive MFA
 #   GARMIN_MCP_TRANSPORT=streamable-http, GARMIN_MCP_HOST=0.0.0.0
