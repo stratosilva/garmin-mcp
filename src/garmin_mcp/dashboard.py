@@ -1601,21 +1601,34 @@ def gather(client):
             "garminLoad": round(sum(row["garminLoad"] for row in rows), 1),
             "days": days, "activities": week_activities,
         })
-    capacity, seed = None, []
+    capacity, seed, prior_efforts = None, [], []
     for index, week in enumerate(weekly_effort):
         effort = week["effort"]
+        is_current = index == len(weekly_effort) - 1
         if capacity is None:
             if effort > 0:
                 seed.append(effort)
+            if not is_current:
+                prior_efforts.append(effort)
             week.update({"rangeLow": None, "rangeHigh": None, "state": "building", "capacity": None})
             if len(seed) >= 4:
                 capacity = sum(seed[-4:]) / 4.0
             continue
-        low_raw, high_raw = capacity * 0.8, capacity * 1.3
+        # The band floor tracks capacity, but the ceiling also widens with the
+        # volatility of the trailing six completed weeks (Strava-like): erratic
+        # recent training stretches the acceptable top end, while consistent
+        # weeks keep the band at the plain 80-130% of capacity.
+        recent = prior_efforts[-6:]
+        sigma = 0.0
+        if len(recent) >= 3:
+            mean = sum(recent) / len(recent)
+            sigma = (sum((value - mean) ** 2 for value in recent) / len(recent)) ** 0.5
+        low_raw = capacity * 0.8
+        high_raw = min(capacity * 2.5, max(capacity * 1.3, capacity + 1.3 * sigma))
         state = "below" if effort < low_raw else "above" if effort > high_raw else "within"
         week.update({"rangeLow": round(low_raw), "rangeHigh": round(high_raw),
                      "state": state, "capacity": round(capacity, 1)})
-        if index == len(weekly_effort) - 1:
+        if is_current:
             # Judge the in-progress week against a day-prorated band so Monday
             # isn't flagged "below range" for lacking a full week of training.
             days_elapsed = min(7, max(1, (today - datetime.date.fromisoformat(week["start"])).days + 1))
@@ -1627,7 +1640,8 @@ def gather(client):
                     "state": ("below" if effort < low_raw * fraction
                               else "above" if effort > high_raw * fraction else "within"),
                 })
-        if index < len(weekly_effort) - 1:  # current partial week cannot set its own target
+        if not is_current:  # current partial week cannot set its own target
+            prior_efforts.append(effort)
             blended = capacity + (effort - capacity) / 6.0
             if state == "within":
                 capacity = max(blended, capacity * 1.03)
@@ -1644,7 +1658,7 @@ def gather(client):
         "baseline": current["capacity"], "days": current["days"],
         "activities": current["activities"],
         "formula": "Each activity scores aerobic minutes by HR zone (below Z1 0.12 · Z1 0.2 · Z2 0.4 · Z3 0.8 · Z4 1.4 · Z5 2.2 points/min) plus Garmin Training Load ÷ 8 for interval intensity — no sport multipliers, so the points are comparable with Strava Relative Effort. Garmin Load ÷ 3 when no heart rate was recorded.",
-        "rangeModel": "The shaded band is the suggested weekly range: 80–130% of adaptive capacity, which follows your training with a ~6-week response and rises after weeks inside or above the band. The current week is judged against the band prorated by days elapsed.",
+        "rangeModel": "The shaded band is the suggested weekly range. Its floor is 80% of adaptive capacity (a ~6-week response that rises after weeks inside or above the band); its ceiling is 130% of capacity, stretched further when the trailing six weeks were erratic (capacity + 1.3× their standard deviation, capped at 2.5× capacity), so big recent weeks widen the acceptable top end. The current week is judged against the band prorated by days elapsed.",
     }
 
     # ---- HR zones this week (minutes per zone) ----
