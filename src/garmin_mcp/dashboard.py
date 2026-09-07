@@ -1187,6 +1187,11 @@ def _hrv_values(payload):
     }
 
 
+# Treadmill sessions at or above this average HR count as runs; below it they
+# are treated as walks (the user walks around 80–100 bpm and runs 125+).
+TREADMILL_RUN_HR = 120
+
+
 def _sport_of(type_key):
     k = (type_key or "").lower()
     if "swim" in k:
@@ -1212,16 +1217,28 @@ def _map_activity(a):
     dist = a.get("distance") or 0
     km = round(dist / 1000.0, 2)
     mins = round(dur / 60.0)
+    avg_hr = _num(a.get("averageHR"))
+    # The watch has no treadmill-walk profile, so treadmill sessions arrive as
+    # "running" whether they were walks or runs; average HR separates the two.
+    if "treadmill" in (at or "").lower() and avg_hr is not None and avg_hr < TREADMILL_RUN_HR:
+        sport = "walk"
     pace = None
     if km > 0 and dur > 0:
         pace = round((dur / 60.0) / km, 2)
     zones = [round((a.get("hrTimeInZone_" + str(i)) or 0) / 60.0, 1) for i in range(1, 6)]
-    # Transparent Suffer-style estimate. Zone coefficients increase
-    # non-linearly, then a sport factor calibrates cross-sport differences to
-    # the user's reference week (run 8 points, SkiErg/HIIT 2 points).
-    effort_base = sum(minutes * weight for minutes, weight in zip(zones, (1, 2, 3, 5, 7))) / 10.0
-    sport_multiplier = {"run": 3.5, "bike": 2.0, "swim": 1.8, "other": 1.7, "walk": 1.0}.get(sport, 1.7)
-    effort = round(effort_base * sport_multiplier, 1)
+    load = round(a.get("activityTrainingLoad") or 0, 1)
+    # Strava-comparable Relative Effort, sport-agnostic. Two additive parts:
+    # an aerobic-volume term where every active minute earns by HR zone (time
+    # below zone 1 keeps a small floor so long walks and easy spins register),
+    # plus Garmin's EPOC-based Training Load ÷ 8, which restores the short
+    # hard intervals that zone buckets flatten out. Weights calibrated against
+    # Strava Relative Effort over the Aug–Sep 2026 reference weeks.
+    easy_minutes = max(0.0, dur / 60.0 - sum(zones))
+    zone_part = (easy_minutes * 1.2 + sum(
+        minutes * weight for minutes, weight in zip(zones, (2, 4, 8, 14, 22)))) / 10.0
+    load_part = load / 8.0
+    has_hr = avg_hr is not None or sum(zones) > 0
+    effort = round(zone_part + load_part, 1) if has_hr else None
     return {
         "activityId": a.get("activityId"),
         "sport": sport,
@@ -1232,15 +1249,15 @@ def _map_activity(a):
         "start": a.get("startTimeLocal"),
         "km": km,
         "min": mins,
-        "hr": _num(a.get("averageHR")),
+        "hr": avg_hr,
         "maxHr": _num(a.get("maxHR")),
         "cal": _num(a.get("calories")),
         "pace": pace,
-        "load": round(a.get("activityTrainingLoad") or 0, 1),
+        "load": load,
         "zones": zones,
-        "effort": effort if sum(zones) else None,
-        "effortBase": round(effort_base, 1) if sum(zones) else None,
-        "effortMultiplier": sport_multiplier,
+        "effort": effort,
+        "effortZonePart": round(zone_part, 1) if has_hr else None,
+        "effortLoadPart": round(load_part, 1) if has_hr else None,
         "location": a.get("locationName"),
         "totalSets": _num(a.get("totalSets")),
         "totalReps": _num(a.get("totalReps")),
@@ -1300,7 +1317,7 @@ def _training_history(activities, today):
         entry = daily.setdefault(date, {"garminLoad": 0.0, "effort": 0.0})
         garmin_load = activity.get("load") or 0
         entry["garminLoad"] += garmin_load
-        entry["effort"] += activity.get("effort") or round(garmin_load / 6.3, 1)
+        entry["effort"] += activity.get("effort") or round(garmin_load / 3.0, 1)
     start, fitness, fatigue, series = max(min(daily) if daily else today, today - datetime.timedelta(days=800)), 0.0, 0.0, []
     for offset in range((today - start).days + 1):
         date, entry = start + datetime.timedelta(days=offset), daily.get(start + datetime.timedelta(days=offset), {})
@@ -1563,8 +1580,10 @@ def gather(client):
         rows = [row for row in out["fitnessSeries"] if start_day.isoformat() <= row["date"] <= end_day.isoformat()]
         week_activities = [
             {"date": activity["date"], "name": activity["name"], "min": activity["min"],
-             "effort": activity.get("effort") or round((activity.get("load") or 0) / 6.3, 1),
-             "garminLoad": activity.get("load"), "hr": activity.get("hr")}
+             "effort": activity.get("effort") or round((activity.get("load") or 0) / 3.0, 1),
+             "garminLoad": activity.get("load"), "hr": activity.get("hr"),
+             "sport": activity.get("sport"),
+             "zonePart": activity.get("effortZonePart"), "loadPart": activity.get("effortLoadPart")}
             for activity in history
             if start_day.isoformat() <= (activity.get("date") or "") <= min(end_day, today).isoformat()
         ]
@@ -1596,6 +1615,18 @@ def gather(client):
         state = "below" if effort < low_raw else "above" if effort > high_raw else "within"
         week.update({"rangeLow": round(low_raw), "rangeHigh": round(high_raw),
                      "state": state, "capacity": round(capacity, 1)})
+        if index == len(weekly_effort) - 1:
+            # Judge the in-progress week against a day-prorated band so Monday
+            # isn't flagged "below range" for lacking a full week of training.
+            days_elapsed = min(7, max(1, (today - datetime.date.fromisoformat(week["start"])).days + 1))
+            if days_elapsed < 7:
+                fraction = days_elapsed / 7.0
+                week.update({
+                    "partial": True, "daysElapsed": days_elapsed,
+                    "projected": round(effort / fraction),
+                    "state": ("below" if effort < low_raw * fraction
+                              else "above" if effort > high_raw * fraction else "within"),
+                })
         if index < len(weekly_effort) - 1:  # current partial week cannot set its own target
             blended = capacity + (effort - capacity) / 6.0
             if state == "within":
@@ -1612,8 +1643,8 @@ def gather(client):
         "rangeLow": current["rangeLow"], "rangeHigh": current["rangeHigh"], "state": current["state"],
         "baseline": current["capacity"], "days": current["days"],
         "activities": current["activities"],
-        "formula": "HR-zone minutes × 1, 2, 3, 5, 7 ÷ 10, then sport-calibrated (run 3.5×; cycling 2×; gym/SkiErg 1.7×). Garmin Load ÷ 6.3 only if zone time is unavailable.",
-        "rangeModel": "The weekly band is 80–130% of adaptive capacity. Capacity uses a six-week response and rises after within/above weeks.",
+        "formula": "Each activity scores aerobic minutes by HR zone (below Z1 0.12 · Z1 0.2 · Z2 0.4 · Z3 0.8 · Z4 1.4 · Z5 2.2 points/min) plus Garmin Training Load ÷ 8 for interval intensity — no sport multipliers, so the points are comparable with Strava Relative Effort. Garmin Load ÷ 3 when no heart rate was recorded.",
+        "rangeModel": "The shaded band is the suggested weekly range: 80–130% of adaptive capacity, which follows your training with a ~6-week response and rises after weeks inside or above the band. The current week is judged against the band prorated by days elapsed.",
     }
 
     # ---- HR zones this week (minutes per zone) ----
@@ -1864,7 +1895,7 @@ button.rf svg{width:15px;height:15px}
 .hydro .bar{margin-top:10px}
 .trendchart{width:100%;height:112px;display:block;margin-top:7px}.trendaxis{display:flex;justify-content:space-between;color:var(--faint);font-size:10.5px;margin-top:2px}
 .loadchart,.effortdaily{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}.loadchart{width:100%;height:190px;display:block;margin-top:8px}.loadchart text,.effortdaily text{font-family:inherit!important;font-size:19px!important;font-weight:600;letter-spacing:.01em}.primarychart{height:300px;margin-top:12px}.keycharts{display:grid;grid-template-columns:1fr;gap:16px}.rangeband{fill:color-mix(in srgb,var(--accent) 18%,transparent)}.charttabs{display:flex;gap:6px;flex-wrap:wrap}.charttabs button{border:1px solid var(--border);background:var(--surface-2);color:var(--muted);border-radius:999px;padding:5px 9px;font-size:11px;font-weight:700;cursor:pointer}.charttabs button.active{background:var(--accent);border-color:var(--accent);color:#fff}.metricnote{font-size:12px;color:var(--muted);margin-top:8px}
-.effortdetail{margin-top:14px;padding-top:13px;border-top:1px solid var(--border)}.effortdaily{width:100%;height:120px;display:block;margin-top:4px;cursor:crosshair}.effortlist{display:grid;gap:7px;margin-top:12px}.effortrow{display:flex;justify-content:space-between;gap:14px;padding:9px 11px;border-radius:10px;background:var(--surface-2);font-size:12.5px;color:var(--muted)}.effortrow b{color:var(--text)}.effortrow .score{white-space:nowrap;color:var(--accent);font-weight:750}.fitsummary{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-top:12px}.fitsummary .change{font-size:28px;font-weight:800}.fitsummary .up{color:var(--good)}.fitsummary .period{width:100%;color:var(--muted);font-size:12.5px}
+.effortdetail{margin-top:14px;padding-top:13px;border-top:1px solid var(--border)}.effortdaily{width:100%;height:120px;display:block;margin-top:4px;cursor:crosshair}.effortlist{display:grid;gap:7px;margin-top:12px}.effortrow{display:flex;justify-content:space-between;gap:14px;padding:9px 11px;border-radius:10px;background:var(--surface-2);font-size:12.5px;color:var(--muted)}.effortrow b{color:var(--text)}.effortrow small{color:var(--faint);font-size:11.5px}.effortrow .score{white-space:nowrap;color:var(--accent);font-weight:750}.effortrow .score.hi{color:var(--warn)}.effortrow .score.max{color:var(--low)}.fitsummary{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-top:12px}.fitsummary .change{font-size:28px;font-weight:800}.fitsummary .up{color:var(--good)}.fitsummary .period{width:100%;color:var(--muted);font-size:12.5px}
 .entry-actions{display:flex;justify-content:flex-end;margin-top:14px}.entry-form{display:none;margin-top:14px;padding:15px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2)}.entry-form.open{display:block}.entry-fields{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.injury-fields{grid-template-columns:repeat(3,1fr)}.entry-fields label{display:grid;gap:4px;font-size:12px;font-weight:700;color:var(--muted)}.entry-fields input{width:100%;border:1px solid var(--border);border-radius:9px;padding:9px;background:var(--surface);color:var(--text);font:inherit}.entry-submit{margin-top:12px;border:0;border-radius:999px;background:var(--accent);color:white;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer}.entry-status{margin:9px 0 0;font-size:12px;color:var(--muted)}.injurychart{width:100%;height:300px;display:block;margin-top:10px}.painlegend{display:flex;flex-wrap:wrap;gap:7px 14px;margin-top:12px;font-size:12px;color:var(--muted)}.painlegend span{display:flex;align-items:center;gap:5px}.painlegend i{width:9px;height:9px;border-radius:50%;display:inline-block}.pain-scale{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
 @media(max-width:640px){.entry-fields,.injury-fields{grid-template-columns:1fr 1fr}.injurychart{height:240px}.primarychart{height:250px}.loadchart text,.effortdaily text{font-size:21px!important}}@media(max-width:420px){.entry-fields,.injury-fields{grid-template-columns:1fr}}
 .strength-open{display:inline-flex;align-items:center;margin-top:5px;border:0;background:transparent;color:var(--accent);padding:2px 0;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer}.strength-card-action{margin-top:12px;width:100%;justify-content:center!important;box-shadow:none!important;background:var(--surface-2)!important}
@@ -2358,21 +2389,52 @@ function drawTrend(svgId,axisId,series,key){
   document.getElementById(axisId).innerHTML=series.map(function(x){return '<span>'+x.label+'</span>';}).join("");chartTip(svg,series,function(x){return '<b>'+x.label+'</b><br>Sleep score: '+n(x.score)+'<br>Sleep: '+n(x.hours)+' h';});
 }
 
+function effortStateText(week){
+  if(week.partial)return {within:"On pace",below:"Behind pace",above:"Ahead of pace"}[week.state]||"Building baseline";
+  return {within:"Within expected range",below:"Below expected range",above:"Above expected range",building:"Building baseline"}[week.state]||"Building baseline";
+}
+
 function drawEffort(data,selectedIndex){
   var svg=document.getElementById("effortc"),weeks=data.weeks||[];if(!svg||!weeks.length)return;svg.innerHTML="";var selected=selectedIndex==null?weeks.length-1:Math.max(0,Math.min(weeks.length-1,selectedIndex));
-  var W=1000,H=360,pL=56,pR=22,pT=28,pB=48,max=Math.max.apply(null,weeks.map(function(x){return Math.max(x.effort||0,x.rangeHigh||0);}).concat([1]))*1.14;
+  var W=1000,H=360,pL=56,pR=30,pT=46,pB=48,max=Math.max.apply(null,weeks.map(function(x){return Math.max(x.effort||0,x.rangeHigh||0);}).concat([1]))*1.14;
   function X(i){return pL+i*(W-pL-pR)/Math.max(1,weeks.length-1)}function Y(v){return pT+(max-v)/max*(H-pT-pB)}
   [0,max/2,max].forEach(function(v){var y=Y(v),l=document.createElementNS(ns,"line"),t=document.createElementNS(ns,"text");l.setAttribute("x1",pL);l.setAttribute("x2",W-pR);l.setAttribute("y1",y);l.setAttribute("y2",y);l.setAttribute("stroke",css("--border"));svg.appendChild(l);t.setAttribute("x",pL-10);t.setAttribute("y",y+5);t.setAttribute("text-anchor","end");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));t.textContent=Math.round(v);svg.appendChild(t);});
-  var valid=weeks.map(function(x,i){return{x:x,i:i};}).filter(function(v){return v.x.rangeHigh!=null;});if(valid.length){var upper=valid.map(function(v,i){return(i?"L":"M")+X(v.i)+" "+Y(v.x.rangeHigh);}).join(" "),lower=valid.slice().reverse().map(function(v){return"L"+X(v.i)+" "+Y(v.x.rangeLow);}).join(" "),band=document.createElementNS(ns,"path");band.setAttribute("d",upper+" "+lower+" Z");band.setAttribute("class","rangeband");svg.appendChild(band);}
+  var valid=weeks.map(function(x,i){return{x:x,i:i};}).filter(function(v){return v.x.rangeHigh!=null;});if(valid.length){var upper=valid.map(function(v,i){return(i?"L":"M")+X(v.i)+" "+Y(v.x.rangeHigh);}).join(" "),lower=valid.slice().reverse().map(function(v){return"L"+X(v.i)+" "+Y(v.x.rangeLow);}).join(" "),band=document.createElementNS(ns,"path");band.setAttribute("d",upper+" "+lower+" Z");band.setAttribute("class","rangeband");svg.appendChild(band);
+    var bl=document.createElementNS(ns,"text");bl.setAttribute("x",W-pR);bl.setAttribute("y",pT-24);bl.setAttribute("text-anchor","end");bl.setAttribute("font-size",14);bl.setAttribute("font-weight",500);bl.setAttribute("fill",css("--faint"));bl.textContent="Shaded = suggested weekly range";svg.appendChild(bl);}
   var line=weeks.map(function(x,i){return(i?"L":"M")+X(i)+" "+Y(x.effort||0);}).join(" "),p=document.createElementNS(ns,"path");p.setAttribute("d",line);p.setAttribute("fill","none");p.setAttribute("stroke",css("--accent"));p.setAttribute("stroke-width",4);p.setAttribute("stroke-linejoin","round");svg.appendChild(p);
   weeks.forEach(function(x,i){var c=document.createElementNS(ns,"circle");c.setAttribute("cx",X(i));c.setAttribute("cy",Y(x.effort||0));c.setAttribute("r",i===selected?9:6);c.setAttribute("fill",i===selected?css("--accent"):css("--surface"));c.setAttribute("stroke",css("--accent"));c.setAttribute("stroke-width",3);svg.appendChild(c);});
-  [0,3,6,9,weeks.length-1].filter(function(v,i,a){return v<weeks.length&&a.indexOf(v)===i;}).forEach(function(i){var t=document.createElementNS(ns,"text");t.setAttribute("x",X(i));t.setAttribute("y",H-13);t.setAttribute("text-anchor","middle");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));t.textContent=weeks[i].label;t.setAttribute("font-weight",i===selected?700:400);svg.appendChild(t);});
-  chartTip(svg,weeks,function(x){return '<b>'+x.rangeLabel+'</b><br>'+x.effort+' effort points<br>Suggested: '+n(x.rangeLow)+'–'+n(x.rangeHigh)+'<br>Garmin Load: '+x.garminLoad;});svg.onclick=function(e){var r=svg.getBoundingClientRect(),chartX=(e.clientX-r.left)/r.width*W,i=Math.round((chartX-pL)/(W-pL-pR)*(weeks.length-1));drawEffort(data,Math.max(0,Math.min(weeks.length-1,i)));};drawEffortWeek(weeks[selected]);
+  var sel=weeks[selected],vx=Math.max(pL+34,Math.min(W-pR-34,X(selected))),vt=document.createElementNS(ns,"text");vt.setAttribute("x",vx);vt.setAttribute("y",Math.max(pT-8,Y(sel.effort||0)-18));vt.setAttribute("text-anchor","middle");vt.setAttribute("font-size",19);vt.setAttribute("font-weight",800);vt.setAttribute("fill",css("--accent"));vt.textContent=n(sel.effort);svg.appendChild(vt);
+  [0,3,6,9,weeks.length-1].filter(function(v,i,a){return v<weeks.length&&a.indexOf(v)===i;}).forEach(function(i){var t=document.createElementNS(ns,"text");t.setAttribute("x",X(i));t.setAttribute("y",H-13);t.setAttribute("text-anchor",i===0?"start":i===weeks.length-1?"end":"middle");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));t.textContent=weeks[i].label;t.setAttribute("font-weight",i===selected?700:400);svg.appendChild(t);});
+  chartTip(svg,weeks,function(x){var i=weeks.indexOf(x),prev=i>0?(weeks[i-1].effort||0):null,delta=prev?Math.round(((x.effort||0)-prev)/prev*100):null;
+    return '<b>'+x.rangeLabel+'</b><br>'+x.effort+' effort points'+(delta!=null?' · '+(delta>=0?'+':'')+delta+'% vs prior week':'')+'<br>'+effortStateText(x)+'<br>Suggested: '+n(x.rangeLow)+'–'+n(x.rangeHigh)+'<br>Garmin Load: '+x.garminLoad;});
+  svg.onclick=function(e){var r=svg.getBoundingClientRect(),chartX=(e.clientX-r.left)/r.width*W,i=Math.round((chartX-pL)/(W-pL-pR)*(weeks.length-1));drawEffort(data,Math.max(0,Math.min(weeks.length-1,i)));};drawEffortWeek(weeks[selected]);
 }
 
 function drawEffortWeek(week){
-  var stateText={within:"Within expected range",below:"Below expected range",above:"Above expected range",building:"Building baseline"}[week.state]||"Building baseline",state=document.getElementById("effort-state"),value=document.getElementById("effort-value"),meta=document.getElementById("effort-meta"),title=document.getElementById("effort-week"),list=document.getElementById("effort-list");if(state){state.textContent=stateText;state.className='pill '+(week.state==='above'?'warn':week.state==='within'?'good':'mute');}if(value)value.textContent=week.effort;if(meta)meta.textContent=week.rangeLabel+' · suggested '+n(week.rangeLow)+'–'+n(week.rangeHigh)+' points · capacity '+n(week.capacity);if(title)title.textContent='Daily effort · '+week.rangeLabel;if(list){list.innerHTML=(week.activities||[]).map(function(a){return '<div class="effortrow"><span><b>'+a.name+'</b> · '+a.min+' min'+(a.hr?' · '+a.hr+' bpm':'')+'<br>Garmin Training Load '+n(a.garminLoad)+'</span><span class="score">'+n(a.effort)+' pts</span></div>';}).join('')||'<div class="meta">No workouts recorded for this week.</div>';}
-  var svg=document.getElementById("effortdaily"),days=week.days||[];if(!svg)return;svg.innerHTML="";var W=1000,H=180,pL=34,pR=14,pT=12,pB=38,max=Math.max.apply(null,days.map(function(x){return x.effort||0;}).concat([1]))*1.12,slot=(W-pL-pR)/7,bw=slot*.46;function Y(v){return pT+(max-v)/max*(H-pT-pB)}days.forEach(function(x,i){var bx=pL+i*slot+(slot-bw)/2,t=document.createElementNS(ns,"text");if(x.effort!=null){var bar=document.createElementNS(ns,"rect");bar.setAttribute("x",bx);bar.setAttribute("y",Y(x.effort));bar.setAttribute("width",bw);bar.setAttribute("height",Math.max(3,H-pB-Y(x.effort)));bar.setAttribute("rx",5);bar.setAttribute("fill",x.effort>0?css("--accent"):css("--track"));svg.appendChild(bar);}t.setAttribute("x",bx+bw/2);t.setAttribute("y",H-10);t.setAttribute("text-anchor","middle");t.setAttribute("font-size",17);t.setAttribute("fill",css("--faint"));t.textContent=x.label;svg.appendChild(t);});chartTip(svg,days,function(x){return '<b>'+x.label+'</b><br>'+n(x.effort)+' effort points';});
+  var state=document.getElementById("effort-state"),value=document.getElementById("effort-value"),meta=document.getElementById("effort-meta"),title=document.getElementById("effort-week"),list=document.getElementById("effort-list");
+  if(state){state.textContent=effortStateText(week);state.className='pill '+(week.state==='above'?'warn':week.state==='within'?'good':'mute');}
+  if(value)value.textContent=week.effort;
+  if(meta)meta.textContent=week.rangeLabel+(week.partial?' · day '+week.daysElapsed+' of 7':'')+' · suggested '+n(week.rangeLow)+'–'+n(week.rangeHigh)+' points'+(week.partial&&week.projected!=null?' · on pace for ~'+week.projected:'')+' · capacity '+n(week.capacity);
+  if(title)title.textContent='Daily effort · '+week.rangeLabel;
+  if(list){list.innerHTML=(week.activities||[]).map(function(a){
+    var day=a.date?new Date(a.date+'T00:00:00').toLocaleDateString(undefined,{weekday:'short',day:'numeric'}):'';
+    var ic={swim:"🏊",bike:"🚴",run:"🏃",walk:"🚶"}[a.sport]||"💪";
+    var v=a.effort||0,cls=v>=25?' max':v>=13?' hi':'';
+    var parts=(a.zonePart!=null&&a.loadPart!=null)?' · aerobic '+n(a.zonePart)+' + intensity '+n(a.loadPart):'';
+    return '<div class="effortrow"><span>'+ic+' <b>'+a.name+'</b>'+(day?' · '+day:'')+' · '+a.min+' min'+(a.hr?' · '+a.hr+' bpm':'')+'<br><small>Garmin Load '+n(a.garminLoad)+parts+'</small></span><span class="score'+cls+'">'+n(a.effort)+' pts</span></div>';
+  }).join('')||'<div class="meta">No workouts recorded for this week.</div>';}
+  var svg=document.getElementById("effortdaily"),days=week.days||[];if(!svg)return;svg.innerHTML="";var W=1000,H=180,pL=34,pR=14,pT=30,pB=38,max=Math.max.apply(null,days.map(function(x){return x.effort||0;}).concat([1]))*1.12,slot=(W-pL-pR)/7,bw=slot*.46;function Y(v){return pT+(max-v)/max*(H-pT-pB)}
+  var now=new Date(),todayIso=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
+  days.forEach(function(x,i){
+    var bx=pL+i*slot+(slot-bw)/2,isToday=x.date===todayIso;
+    var base=document.createElementNS(ns,"rect");base.setAttribute("x",bx);base.setAttribute("y",H-pB-3);base.setAttribute("width",bw);base.setAttribute("height",3);base.setAttribute("rx",1.5);base.setAttribute("fill",css("--track"));svg.appendChild(base);
+    if(x.effort>0){
+      var bar=document.createElementNS(ns,"rect");bar.setAttribute("x",bx);bar.setAttribute("y",Y(x.effort));bar.setAttribute("width",bw);bar.setAttribute("height",Math.max(3,H-pB-Y(x.effort)));bar.setAttribute("rx",5);bar.setAttribute("fill",css("--accent"));svg.appendChild(bar);
+      var vl=document.createElementNS(ns,"text");vl.setAttribute("x",bx+bw/2);vl.setAttribute("y",Y(x.effort)-8);vl.setAttribute("text-anchor","middle");vl.setAttribute("font-size",17);vl.setAttribute("font-weight",700);vl.setAttribute("fill",css("--text"));vl.textContent=Math.round(x.effort);svg.appendChild(vl);
+    }
+    var t=document.createElementNS(ns,"text");t.setAttribute("x",bx+bw/2);t.setAttribute("y",H-10);t.setAttribute("text-anchor","middle");t.setAttribute("font-size",17);t.setAttribute("fill",isToday?css("--accent"):css("--faint"));if(isToday)t.setAttribute("font-weight",800);t.textContent=x.label;svg.appendChild(t);
+  });
+  chartTip(svg,days,function(x){return '<b>'+x.label+'</b><br>'+(x.effort==null?'Not yet':n(x.effort)+' effort points');});
 }
 
 function drawFitness(series,days,selectedIndex){
