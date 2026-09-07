@@ -1,9 +1,10 @@
-# Garmin → Claude · Self-Hosted MCP Server + Live Dashboard
+# Garmin → ChatGPT / Codex · Self-Hosted MCP Server + Live Dashboard
 
-Put your **Garmin Connect** data inside **Claude** — and run your own private
-**health & triathlon dashboard** — on a small server that's entirely yours.
+Use your **Garmin Connect** data with **ChatGPT, Codex, or another
+MCP-compatible client** — and run your own private **health & triathlon
+dashboard** on a small server that's entirely yours.
 
-- 🗣️ **Ask your body data in plain English** in Claude (web, desktop, mobile):
+- 🗣️ **Ask about your body data in plain English** from a connected AI client:
   *"How did I sleep?"*, *"Show my last 5 runs"*, *"Am I recovered for a hard session?"*
 - 📊 **A live dashboard** at `/dashboard` — body battery, sleep, heart rate,
   stress, VO₂ max, training load, HR zones, weight/hydration, and a
@@ -11,26 +12,18 @@ Put your **Garmin Connect** data inside **Claude** — and run your own private
 - 🔒 **Private by design** — runs on *your* Railway account, locked with *your*
   bearer token. Your Garmin password never leaves your own computer.
 
-Built for the community by [Sudhakar Reddy Gade](https://nirvedha.com/about/) ·
-📖 **Full step-by-step guide (no coding needed): <https://www.nirvedha.com/garmin-dashboard/>**
+This fork extends the original community project by
+[Sudhakar Reddy Gade](https://nirvedha.com/about/) with a PostgreSQL-backed
+dashboard and OpenAI-powered recommendations.
 
 ---
 
 ## Quick start
 
-### The easy way — let Claude Code do it
-Install [Claude Code](https://claude.ai/code), open it in an empty folder, and
-paste the ready-made prompt from the
-[guide](https://www.nirvedha.com/garmin-dashboard/). It clones this repo, mints
-your Garmin token, deploys to Railway, and hands you your connector + dashboard
-URLs. You only approve the Railway login and type your Garmin password into your
-own terminal.
-
-### The hands-on way
-Fork this repo and follow the **[guide](https://www.nirvedha.com/garmin-dashboard/)**
-(8 clicks-and-copy steps, ~20 minutes) or the concise **[SETUP.md](SETUP.md)**.
-In short: fork → deploy on Railway → add a volume at `/root/.garminconnect` →
-set four variables → generate a domain → add to Claude.
+Follow **[SETUP.md](SETUP.md)** to deploy on Railway, attach the persistent
+Garmin volume, configure the required variables, and add PostgreSQL for
+dashboard-entered data. Then connect the `/mcp` endpoint from a compatible AI
+client, or use the live `/dashboard` directly.
 
 ---
 
@@ -38,9 +31,9 @@ set four variables → generate a domain → add to Claude.
 
 | | |
 |---|---|
-| **MCP tools** | 90+ Garmin tools (activities, sleep, HRV, body battery, training, gear, …) usable from Claude |
+| **MCP tools** | 90+ Garmin tools (activities, sleep, HRV, body battery, training, gear, …) usable from an MCP-compatible client |
 | **Transport** | Streamable HTTP at `/mcp`, health check at `/healthz` |
-| **Auth** | Bearer token on every request (header **or** `?token=` in the URL, for clients like Claude that can't set headers) |
+| **Auth** | Bearer token on every request (normally the `Authorization` header; the dashboard can also use `?token=`) |
 | **Dashboard** | Server-rendered, live-on-refresh single page at `/dashboard` |
 | **Persistence** | Garmin OAuth tokens on a mounted volume, auto-refreshing |
 | **Cost** | ~$5/month on Railway's Hobby plan |
@@ -76,7 +69,7 @@ backup. Without `DATABASE_URL`, the legacy file storage continues to work.
 ### Personalised dashboard recommendation
 
 When `OPENAI_API_KEY` is configured, the dashboard's summary line is replaced
-with a structured next-24–48-hour cardio and strength recommendation. The
+with a structured next-24–48-hour cardio, strength, and recovery/mobility recommendation. The
 strength section supplies six movement slots with two alternatives per slot,
 three sets, reps and a history-grounded load prescription. One recommendation is generated
 and saved per dashboard day, so ordinary page refreshes reuse it without making
@@ -128,7 +121,7 @@ See **[SETUP.md](SETUP.md)** for the full list, token rotation, and re-auth.
 ## Architecture
 
 ```
-Claude (web / desktop / mobile)  ──HTTPS + bearer token──►  Railway service
+ChatGPT / Codex / MCP client  ──HTTPS + bearer token──►  Railway service
                                                                  │
                     BearerAuthMiddleware ──► /healthz (open) · /mcp · /dashboard
                                                                  │
@@ -142,7 +135,7 @@ Claude (web / desktop / mobile)  ──HTTPS + bearer token──►  Railway se
 
 ```bash
 uv sync
-# stdio (for Claude Desktop config):
+# stdio (for a local MCP client):
 GARMIN_MCP_TRANSPORT=stdio uv run garmin-mcp
 # streamable HTTP + dashboard:
 MCP_ACCESS_TOKEN=$(python3 -c "import secrets;print(secrets.token_urlsafe(32))") \
