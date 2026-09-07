@@ -130,6 +130,15 @@ railway logs
 | `GARMIN_MFA_WAIT_SECONDS` | Optional | Poll this long (e.g. `180`) for `GARMIN_MFA_CODE`/file to appear. |
 | `PORT` | Auto | Injected by Railway; the server binds it. |
 | `GARMINTOKENS` | Optional | Token dir; defaults to `~/.garminconnect` (the volume). |
+| `STRENGTH_LOG_PATH` | Optional | Dashboard strength corrections/manual sets; defaults to `~/.garminconnect/strength_training.json` on the same volume. |
+| `DATABASE_URL` | Recommended | PostgreSQL connection URL used for all dashboard-entered measurements and strength overlays. Reference the Railway Postgres service's `DATABASE_URL`. |
+
+### PostgreSQL for dashboard-entered data
+
+Add a PostgreSQL service to the Railway project and expose its `DATABASE_URL`
+to the `garmin-mcp` service. On the next request, the dashboard creates its
+tables and performs an idempotent one-time import from the legacy CSV/JSON files
+on `/root/.garminconnect`. The original files are retained as a backup.
 | `GARMIN_MCP_ENABLE_HOST_CHECK` | Optional | Re-enable the MCP DNS-rebinding Host check (off by default; the bearer token already gates access). |
 | `GARMIN_MCP_ALLOWED_HOSTS` | Optional | Extra comma-separated Host values to allow when the host check is on. `RAILWAY_PUBLIC_DOMAIN` is added automatically. |
 

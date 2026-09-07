@@ -58,18 +58,55 @@ set four variables → generate a domain → add to Claude.
 | `DASHBOARD_TZ_OFFSET_HOURS` | Optional | Local-day offset for the dashboard (default `5.5` = IST) |
 | `OPENAI_API_KEY` | Optional | Server-side OpenAI API key for the personalised 24–48h dashboard recommendation |
 | `OPENAI_RECOMMENDATION_MODEL` | Optional | Model used for that recommendation (default `gpt-5-mini`) |
+| `STRENGTH_LOG_PATH` | Optional | File for dashboard strength corrections and manual sets (default `~/.garminconnect/strength_training.json`) |
+| `DATABASE_URL` | Recommended | PostgreSQL connection URL for body measurements, injury scores, and strength-workout overlays. Railway Postgres supplies this automatically when referenced by the service. |
+
+### Dashboard database
+
+When `DATABASE_URL` is configured, dashboard-entered data is stored in PostgreSQL:
+
+- `dashboard_body_measurements`
+- `dashboard_injury_measurements`
+- `dashboard_strength_overlays`
+
+The application creates these tables at first use. It then imports the existing
+body, injury, and strength files once and leaves those files untouched as a
+backup. Without `DATABASE_URL`, the legacy file storage continues to work.
 
 ### Personalised dashboard recommendation
 
 When `OPENAI_API_KEY` is configured, the dashboard's summary line is replaced
-with a concise next-24–48-hour recommendation. One recommendation is generated
+with a structured next-24–48-hour cardio and strength recommendation. The
+strength section supplies six movement slots with two alternatives per slot,
+three sets, reps and a history-grounded load prescription. One recommendation is generated
 and saved per dashboard day, so ordinary page refreshes reuse it without making
 another model request. Use **Refresh advice** after logging meaningful new data
 (for example, a workout, sleep, or pain score) to explicitly request a new one.
 The browser sends the current dashboard snapshot to the protected server; the
-server reduces it to recovery, fitness, body-composition and latest pain signals
-before making the OpenAI API request. The API key is never sent to or stored in
-the browser.
+server reduces it to recovery, fitness, body-composition, strength-training and
+latest pain signals before making the OpenAI API request. The API key is never
+sent to or stored in the browser.
+
+Strength activities can be completed from the dashboard after syncing from
+Garmin. Open a recent strength activity, assign an exercise to each set, correct
+reps or weight, mark unilateral reps as **per side**, or add sets that the watch
+did not record. Manual sets accept repetitions or a duration in seconds, so
+carries and isometric holds can be recorded with time and optional load. For a
+carry, use total carried load consistently (for example, two 24 kg dumbbells as
+48 kg). For unilateral holds, **Reps/time are per side** records one duration
+for each side. **Copy previous** repeats reps, seconds and weight in one tap, while
+**Apply to this + next 2** fills the common three-set exercise pattern.
+These edits are a non-destructive local overlay: Garmin's original values stay
+visible and can be restored, while the corrected values and manual sets are used
+in personalised recommendations. The overlay file should live on the same
+persistent volume as the Garmin tokens in production.
+
+The dashboard also rolls those saved working sets into a 12-week muscle-stimulus
+view. Primary muscles receive one direct-set credit and assisting muscles receive
+half a credit; cardio, steps and recorded floors add conservative, capped
+supporting exposure. The selected week's exercise table makes every allocation
+visible and flags unclassified exercises instead of silently guessing. These are
+planning units, not measured muscle activation or literal hypertrophy-set counts.
 
 Create an API key in the OpenAI Platform and set it as a Railway environment
 variable. ChatGPT subscriptions and API billing are managed separately. If the

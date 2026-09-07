@@ -16,6 +16,7 @@ import datetime
 import json
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -28,6 +29,145 @@ from starlette.routing import Route
 _HISTORY_CACHE = {"at": 0.0, "activities": []}
 _BODY_FIELDS = ("weight_kg", "fat_pct", "muscle_pct", "body_water_pct")
 _INJURY_FIELDS = ("left_big_toe_strain", "left_foot_plantar_fasciitis", "right_knee_patellar_tendon")
+_STRENGTH_LOG_LOCK = threading.Lock()
+_STRENGTH_FALLBACK_EXERCISES = (
+    "Barbell Bulgarian Split Squat", "Dumbbell Bulgarian Split Squat",
+    "Bulgarian Split Squat", "Barbell Lateral Step-up", "Dumbbell Lateral Step-up",
+    "Lateral Step-up", "Leg Curl", "Seated Leg Curl", "Lying Leg Curl",
+    "Chest Press", "Machine Chest Press", "Dumbbell Chest Press", "Barbell Bench Press",
+    "Calf Raise", "Standing Calf Raise", "Seated Calf Raise", "Leg Press",
+    "Leg Extension", "Squat", "Goblet Squat", "Romanian Deadlift", "Hip Thrust",
+    "Lat Pull-down", "Seated Row", "Shoulder Press", "Lateral Raise", "Biceps Curl",
+    "Triceps Press-down", "Push-up", "Pull-up", "Plank",
+    "Farmer's Walk", "Farmers Walk", "Suitcase Carry", "Side Plank", "Lateral Plank",
+    "Dead Hang", "Wall Sit",
+    "Split Stance Anti-Rotation Cable Lift",
+)
+_STRENGTH_EXERCISE_CACHE = None
+_STRENGTH_LOOKUP_CACHE = None
+_STRENGTH_CATEGORY_CACHE = None
+_MUSCLE_GROUPS = (
+    ("delts", "Delts"), ("triceps", "Triceps"), ("biceps", "Biceps"),
+    ("back", "Back / lats"), ("quads", "Quads"), ("glutes", "Glutes"),
+    ("hamstrings", "Hamstrings"), ("chest", "Chest"), ("core", "Core"),
+    ("calves", "Calves"),
+)
+_CARDIO_MUSCLE_FACTORS = {
+    # One cardio unit is 20 minutes. These deliberately remain conservative:
+    # they represent supporting exposure, not literal hypertrophy-set counts.
+    "run": {"quads": .65, "glutes": .55, "hamstrings": .45, "calves": .55, "core": .20},
+    "bike": {"quads": .70, "glutes": .50, "hamstrings": .35, "calves": .25, "core": .15},
+    "walk": {"quads": .20, "glutes": .18, "hamstrings": .12, "calves": .22, "core": .08},
+    "swim": {"back": .55, "delts": .50, "triceps": .30, "chest": .25, "core": .30},
+    "elliptical": {"quads": .55, "glutes": .45, "hamstrings": .35, "calves": .25, "core": .15},
+    "stairs": {"quads": .70, "glutes": .75, "hamstrings": .30, "calves": .40, "core": .20},
+    "skierg": {"back": .65, "triceps": .50, "delts": .30, "core": .50, "glutes": .25, "hamstrings": .25},
+    "rowing": {"back": .65, "biceps": .30, "quads": .45, "glutes": .40, "hamstrings": .35, "core": .35},
+}
+_GARMIN_CATEGORY_MUSCLES = {
+    "BATTLE_ROPE": (("delts", "core"), ("biceps", "back")),
+    "BENCH_PRESS": (("chest",), ("triceps", "delts")),
+    "BIKE_OUTDOOR": (("quads", "glutes"), ("hamstrings", "calves", "core")),
+    "CALF_RAISE": (("calves",), ()),
+    "CARRY": (("core",), ("delts", "back")),
+    "CHOP": (("core",), ("delts", "glutes")),
+    "CORE": (("core",), ()),
+    "CRUNCH": (("core",), ()),
+    "CURL": (("biceps",), ()),
+    "DEADLIFT": (("hamstrings", "glutes"), ("back", "core")),
+    "ELLIPTICAL": (("quads", "glutes"), ("hamstrings", "calves")),
+    "FLOOR_CLIMB": (("quads", "glutes"), ("calves", "hamstrings")),
+    "FLYE": (("chest",), ("delts",)),
+    "HIP_RAISE": (("glutes",), ("hamstrings", "core")),
+    "HIP_STABILITY": (("glutes", "core"), ("hamstrings",)),
+    "HIP_SWING": (("glutes", "hamstrings"), ("core",)),
+    "HYPEREXTENSION": (("back", "glutes"), ("hamstrings", "core")),
+    "INDOOR_BIKE": (("quads", "glutes"), ("hamstrings", "calves", "core")),
+    "LADDER": (("quads", "calves"), ("glutes", "core")),
+    "LATERAL_RAISE": (("delts",), ()),
+    "LEG_CURL": (("hamstrings",), ("glutes",)),
+    "LEG_RAISE": (("core",), ("quads",)),
+    "LUNGE": (("quads", "glutes"), ("hamstrings", "core")),
+    "OLYMPIC_LIFT": (("quads", "glutes", "delts"), ("hamstrings", "back", "core")),
+    "PLANK": (("core",), ("delts", "glutes")),
+    "PLYO": (("quads", "glutes", "calves"), ("hamstrings", "core")),
+    "PULL_UP": (("back",), ("biceps", "delts")),
+    "PUSH_UP": (("chest",), ("triceps", "delts")),
+    "ROW": (("back",), ("biceps", "delts")),
+    "RUN": (("quads", "glutes"), ("hamstrings", "calves", "core")),
+    "RUN_INDOOR": (("quads", "glutes"), ("hamstrings", "calves", "core")),
+    "SANDBAG": (("quads", "glutes", "core"), ("hamstrings", "back", "delts")),
+    "SHOULDER_PRESS": (("delts",), ("triceps", "core")),
+    "SHOULDER_STABILITY": (("delts", "core"), ("back",)),
+    "SHRUG": (("back", "delts"), ()),
+    "SIT_UP": (("core",), ()),
+    "SLED": (("quads", "glutes"), ("hamstrings", "calves", "core")),
+    "SLEDGE_HAMMER": (("core", "delts"), ("back", "triceps")),
+    "SQUAT": (("quads", "glutes"), ("hamstrings", "core")),
+    "STAIR_STEPPER": (("quads", "glutes"), ("hamstrings", "calves")),
+    "SUSPENSION": (("core",), ("delts", "back")),
+    "TIRE": (("quads", "glutes", "core"), ("hamstrings", "back", "delts")),
+    "TOTAL_BODY": (("quads", "glutes", "core"), ("hamstrings", "back", "delts")),
+    "TRICEPS_EXTENSION": (("triceps",), ()),
+}
+_RECOMMENDATION_PROMPT_VERSION = 5
+_RECOMMENDATION_INSTRUCTIONS = (
+    "You are a cautious endurance and strength coach. Use only the supplied data. Produce a "
+    "practical next-24–48-hour plan in plain text, no more than 550 words, using exactly three "
+    "clearly separated sections: CARDIO, STRENGTH — NEXT WORKOUT, and RECOVERY / MOBILITY. Coordinate the two so the "
+    "combined leg load is sensible. The goals are to improve VO2, support recovery from the "
+    "current leg injuries, return gradually to running, and build balanced strength.\n\n"
+    "CARDIO: Recommend one preferred session and one lower-impact alternative chosen from "
+    "cycling, walking, running, elliptical, rowing, SkiErg, intervals or sprints as appropriate. "
+    "For both, give duration, warm-up/cool-down, heart-rate zone or RPE, and interval/recovery "
+    "details where relevant. Interpret pain with the supplied prior-day-load-and-today-pain comparison: "
+    "it can indicate tolerance, not prove causation. Low and stable symptoms are not automatically a "
+    "reason to prohibit running. When plantar-fascia and patellar-tendon symptoms are 0–2/10 and have "
+    "remained at or below their baseline the morning after a comparable run, a modest, conservative "
+    "progression can be considered only if readiness and load also support it. At 3/10, prefer a flat, "
+    "easy conversational run at maintained or slightly reduced volume; avoid speed work, sprints, "
+    "plyometrics, steep hills and especially downhill running. Do not increase running volume while "
+    "either symptom is around 3/10. Acknowledge a successful, low-pain next-day response positively "
+    "and explain what it supports. If symptoms rise during the session, become sharp, or are worse the "
+    "following morning, recommend reducing or substituting the next impact session. At 4/10 or above, "
+    "or with a worsening trend, prefer pain-free lower-impact work. Briefly name the most important "
+    "data signals behind the choice.\n\n"
+    "STRENGTH — NEXT WORKOUT: Give exactly six numbered movement slots. Each slot must contain "
+    "exactly two alternative exercises, A and B; the athlete chooses one option per slot, not all "
+    "twelve. Every option must prescribe three working sets, repetitions and load. A compact form "
+    "such as '3 × 10 @ 20 kg' specifies all three sets; say reps per side for unilateral work. "
+    "For carries and isometric holds, prescribe '3 × seconds @ load' instead of repetitions. "
+    "Format each numbered slot on three lines: the movement goal, then option A, then option B. "
+    "Balance upper and lower body while using the current week's direct and total muscle stimulus "
+    "to address meaningful gaps. Direct-set gaps matter more for strength than cardio exposure: "
+    "for example, if hamstrings have no direct work, a slot can offer Romanian deadlift versus leg "
+    "curl, with exercise-appropriate reps and different loads. Include pain-free calf, foot, knee, "
+    "hip or trunk capacity where it supports a gradual return to running, without claiming to treat an injury.\n\n"
+    "Use entered strength_training sets—including corrected Garmin data, manual sets, custom names, "
+    "reps, timed-set duration, weights and per-side flags—as the athlete's actual history. Prefer familiar exercises. "
+    "Base a numeric load on that same exercise's history; never transfer loads between exercises or "
+    "machines. Keep progression conservative, normally no more than about 2.5–5% when recent sets "
+    "were completed comfortably and recovery and pain are stable. When an option lacks its own load "
+    "history, write 'load: choose a pain-free load with 2–3 reps in reserve', 'bodyweight', or an "
+    "appropriate band level instead of inventing kilograms. Briefly explain how the six slots balance "
+    "the current muscle stimulus.\n\n"
+    "RECOVERY / MOBILITY: Give 2–4 concise, optional actions for today or after the proposed session. "
+    "Use the recorded activity and strength sets from today and yesterday, plus the current pain trend, "
+    "to select the actions rather than giving a generic routine. Each action must state its purpose, "
+    "dose (time, repetitions or sets), and a pain-limited instruction. Gentle mobility, calf or foot "
+    "capacity work, quadriceps/hip work, and stretching can be suggested when they fit the recorded load. "
+    "Foam rolling may target comfortable surrounding muscle (for example calves, quads, glutes or upper back), "
+    "but do not instruct direct, aggressive rolling over a painful plantar fascia, patellar tendon, or bony area. "
+    "Do not present stretching or foam rolling as a cure. Skip actions that duplicate a demanding exercise already "
+    "performed today or would add meaningful load to an irritated area.\n\n"
+    "Use 7-day sleep, HRV, readiness, stress, training load, relative effort, fitness, VO2, heart-rate "
+    "zones, recent cardio and muscle-stimulus trends together rather than reacting to one metric. Use "
+    "calories, weight and body composition only as sustainable guardrails; activity calories are "
+    "expenditure, not food intake. Do not diagnose or promise injury recovery. This is load-management "
+    "guidance, not a diagnosis. If pain is 4/10 or higher, worsening, sharp, or the recommended movement "
+    "provokes escalating pain, substitute pain-free low-impact work and advise professional assessment "
+    "if symptoms persist or worsen. Do not repeat every metric or mention missing data."
+)
 
 
 def _recommendation_snapshot(dashboard):
@@ -35,62 +175,141 @@ def _recommendation_snapshot(dashboard):
     wellness = dashboard.get("wellness") or {}
     body = (dashboard.get("body") or {}).get("metrics") or {}
     injuries = (dashboard.get("injuries") or {}).get("records") or []
+    recent_activities = dashboard.get("recent") or []
+    recent_activities = recent_activities if isinstance(recent_activities, list) else []
+    recent_cardio = [row for row in recent_activities
+                     if isinstance(row, dict) and not row.get("isStrength") and _cardio_mode(row)]
+    muscle_weeks = ((dashboard.get("muscleVolume") or {}).get("weeks") or [])[-2:]
     latest_pain = next((row for row in reversed(injuries)
                         if any(row.get(field) is not None for field in _INJURY_FIELDS)), None)
+    previous_day_response = _previous_day_pain_response(
+        dashboard.get("date"), injuries, recent_activities, dashboard.get("strength") or {},
+    )
     return {
         "date": dashboard.get("date"),
         "recovery": {
             "body_battery": wellness.get("bodyBattery"),
             "training_readiness": wellness.get("readiness"),
             "sleep": wellness.get("sleep"),
+            "sleep_history_7d": (dashboard.get("sleepSeries") or [])[-7:],
             "hrv": wellness.get("hrv"),
+            "hrv_history_7d": (dashboard.get("hrvSeries") or [])[-7:],
             "resting_heart_rate": wellness.get("restingHr"),
             "stress": wellness.get("stress"),
+        },
+        "energy_and_body": {
+            "activity_calories": wellness.get("calories"),
+            "garmin_weight": wellness.get("weight"),
+            "body_composition": body,
+            "body_history": ((dashboard.get("body") or {}).get("records") or [])[-10:],
         },
         "fitness": {
             "vo2_max_run": wellness.get("vo2maxRun"),
             "vo2_max_bike": wellness.get("vo2maxBike"),
             "training_load": wellness.get("trainingLoad"),
+            "training_load_trend_7d": dashboard.get("trainingLoadTrend") or [],
             "relative_effort": dashboard.get("relativeEffort"),
-            "recent_activities": (dashboard.get("recent") or [])[:5],
+            "fitness_level_trend_42d": (dashboard.get("fitnessSeries") or [])[-42:],
+            "hr_zones_week": dashboard.get("hrZonesWeek") or [],
+            "intensity_minutes": wellness.get("intensity"),
+            "cardio_by_sport": dashboard.get("sports") or {},
+            "recent_cardio_workouts": recent_cardio[:8],
+            "recent_activities": recent_activities[:12],
         },
+        "strength_training": dashboard.get("strength") or {"activities": []},
+        "muscle_stimulus_recent_weeks": muscle_weeks,
         "body_composition": body,
         "pain_latest": latest_pain,
+        "pain_trend_14d": injuries[-14:],
+        "prior_day_load_and_today_pain": previous_day_response,
+    }
+
+
+def _previous_day_pain_response(today_value, injuries, activities, strength):
+    """Summarise yesterday's recorded load beside today's pain, without claiming causation."""
+    try:
+        today = datetime.date.fromisoformat(str(today_value)[:10])
+    except (TypeError, ValueError):
+        return None
+    yesterday = today - datetime.timedelta(days=1)
+    pain_by_date = {
+        str(row.get("date"))[:10]: row for row in injuries
+        if isinstance(row, dict) and row.get("date")
+    }
+    today_pain = pain_by_date.get(today.isoformat())
+    yesterday_pain = pain_by_date.get(yesterday.isoformat())
+    if not today_pain:
+        return None
+
+    previous_activities = [
+        {key: row.get(key) for key in ("name", "sport", "typeKey", "min", "km", "load", "effort", "zones")}
+        for row in activities
+        if isinstance(row, dict) and str(row.get("date") or "")[:10] == yesterday.isoformat()
+    ]
+    previous_strength = []
+    for activity in (strength.get("activities") or []):
+        if not isinstance(activity, dict) or str(activity.get("start") or "")[:10] != yesterday.isoformat():
+            continue
+        previous_strength.append({
+            "name": activity.get("name"), "workingSets": activity.get("workingSets"),
+            "timedSeconds": activity.get("timedSeconds"), "sets": activity.get("sets") or [],
+        })
+    changes = {}
+    for field in _INJURY_FIELDS:
+        current, previous = today_pain.get(field), (yesterday_pain or {}).get(field)
+        if isinstance(current, (int, float)) and isinstance(previous, (int, float)):
+            changes[field] = round(current - previous, 1)
+        else:
+            changes[field] = None
+    return {
+        "activity_date": yesterday.isoformat(), "today_date": today.isoformat(),
+        "previous_day_activities": previous_activities,
+        "previous_day_strength": previous_strength,
+        "previous_day_pain": {field: (yesterday_pain or {}).get(field) for field in _INJURY_FIELDS},
+        "today_pain": {field: today_pain.get(field) for field in _INJURY_FIELDS},
+        "pain_change_next_day": changes,
+        "note": "Association only: assess the full pattern and the athlete's in-session symptoms, not one day alone.",
     }
 
 
 def _openai_recommendation(dashboard):
-    """Request a concise, non-medical next-48-hour coaching recommendation."""
+    """Request a structured, non-medical next-48-hour coaching recommendation."""
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Personal recommendations are not configured yet.")
 
     model = os.environ.get("OPENAI_RECOMMENDATION_MODEL", "gpt-5-mini")
-    instructions = (
-        "You are a cautious endurance and general-fitness coach. Use only the supplied "
-        "data. Give one concise recommendation for the next 24–48 hours (maximum 70 "
-        "words). State the training intensity or recovery action, and name the two most "
-        "important signals behind it. Do not diagnose, prescribe, or claim medical certainty. "
-        "If pain is 4/10 or higher, worsening, or recovery signals are poor, favour rest or "
-        "easy movement and advise professional assessment if pain persists or worsens. "
-        "Do not repeat every metric or mention missing data."
-    )
     response = requests.post(
         "https://api.openai.com/v1/responses",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "model": model,
-            "instructions": instructions,
+            "instructions": _RECOMMENDATION_INSTRUCTIONS,
             "input": json.dumps(_recommendation_snapshot(dashboard), separators=(",", ":")),
-            "max_output_tokens": 180,
+            # Spend the response budget on the visible two-part workout plan.
+            "reasoning": {"effort": "none"},
+            "max_output_tokens": 1200,
             "store": False,
         },
-        timeout=20,
+        timeout=45,
     )
     if not response.ok:
-        raise RuntimeError("The recommendation service is temporarily unavailable.")
+        try:
+            error = response.json().get("error") or {}
+            code = error.get("code") or error.get("type") or "request_failed"
+        except ValueError:
+            code = "request_failed"
+        raise RuntimeError(f"OpenAI request failed (HTTP {response.status_code}: {code}).")
     payload = response.json()
     text = (payload.get("output_text") or "").strip()
+    if not text:
+        text = "\n".join(
+            part.get("text", "")
+            for item in payload.get("output", [])
+            if isinstance(item, dict)
+            for part in item.get("content", [])
+            if isinstance(part, dict) and part.get("type") == "output_text"
+        ).strip()
     if not text:
         raise RuntimeError("The recommendation service returned no advice.")
     return {"text": text, "model": model}
@@ -114,18 +333,629 @@ def _recommendation_cache_path():
     return Path(configured) if configured else Path.home() / ".garminconnect" / "daily_recommendation.json"
 
 
+def _strength_log_path():
+    """Persistent local corrections and manual sets for Garmin strength activities."""
+    configured = os.environ.get("STRENGTH_LOG_PATH")
+    return Path(configured) if configured else Path.home() / ".garminconnect" / "strength_training.json"
+
+
+def _dashboard_database():
+    """Use PostgreSQL in production and import the legacy files on first use."""
+    if not os.environ.get("DATABASE_URL"):
+        return None
+    from garmin_mcp.dashboard_storage import database
+
+    return database(_body_measurements_path(), _injury_measurements_path(), _strength_log_path())
+
+
+def _strength_exercise_catalog():
+    """Return Garmin's exercise names when the installed client exposes its catalog."""
+    global _STRENGTH_EXERCISE_CACHE
+    if _STRENGTH_EXERCISE_CACHE is not None:
+        return _STRENGTH_EXERCISE_CACHE
+    names = list(_STRENGTH_FALLBACK_EXERCISES)
+    try:
+        from garminconnect.exercises import EXERCISES
+        names.extend(row.get("name") for row in EXERCISES if isinstance(row, dict))
+    except (ImportError, AttributeError):
+        pass
+    _STRENGTH_EXERCISE_CACHE = sorted({name.strip() for name in names if isinstance(name, str) and name.strip()}, key=str.casefold)
+    return _STRENGTH_EXERCISE_CACHE
+
+
+def _strength_exercise_lookup():
+    global _STRENGTH_LOOKUP_CACHE
+    if _STRENGTH_LOOKUP_CACHE is not None:
+        return _STRENGTH_LOOKUP_CACHE
+    lookup = {}
+    try:
+        from garminconnect.exercises import EXERCISES
+        for row in EXERCISES:
+            if not isinstance(row, dict):
+                continue
+            category, exercise, name = row.get("category"), row.get("exercise"), row.get("name")
+            if category and exercise and name:
+                lookup[(str(category).upper(), str(exercise).upper())] = str(name)
+    except (ImportError, AttributeError):
+        pass
+    _STRENGTH_LOOKUP_CACHE = lookup
+    return _STRENGTH_LOOKUP_CACHE
+
+
+def _strength_category_lookup():
+    global _STRENGTH_CATEGORY_CACHE
+    if _STRENGTH_CATEGORY_CACHE is not None:
+        return _STRENGTH_CATEGORY_CACHE
+    lookup = {}
+    try:
+        from garminconnect.exercises import EXERCISES
+        for row in EXERCISES:
+            if isinstance(row, dict) and row.get("name") and row.get("category"):
+                lookup[str(row["name"]).casefold()] = str(row["category"]).upper()
+    except (ImportError, AttributeError):
+        pass
+    _STRENGTH_CATEGORY_CACHE = lookup
+    return _STRENGTH_CATEGORY_CACHE
+
+
+def _read_strength_log_unlocked():
+    db = _dashboard_database()
+    if db:
+        return db.strength_store()
+    try:
+        payload = json.loads(_strength_log_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {"version": 1, "activities": {}}
+    if not isinstance(payload, dict) or not isinstance(payload.get("activities"), dict):
+        return {"version": 1, "activities": {}}
+    payload["version"] = 1
+    return payload
+
+
+def _write_strength_log_unlocked(payload):
+    db = _dashboard_database()
+    if db:
+        for activity_id, entry in payload.get("activities", {}).items():
+            db.save_strength_entry(activity_id, entry)
+        return
+    target = _strength_log_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(target)
+
+
+def _strength_text(value, field="exercise", maximum=120):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be text")
+    value = value.strip()
+    if len(value) > maximum:
+        raise ValueError(f"{field} is too long")
+    return value or None
+
+
+def _strength_number(value, field, minimum, maximum, integer=False):
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a number") from exc
+    if not minimum <= number <= maximum:
+        raise ValueError(f"{field} must be between {minimum} and {maximum}")
+    if integer and not number.is_integer():
+        raise ValueError(f"{field} must be a whole number")
+    return int(number) if integer else round(number, 3)
+
+
+def _strength_activity_id(value):
+    try:
+        activity_id = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("activity id must be a positive number") from exc
+    if activity_id <= 0:
+        raise ValueError("activity id must be a positive number")
+    return activity_id
+
+
+def _exercise_label(exercises):
+    """Translate Garmin's category/name enums into the catalog's display name."""
+    if not isinstance(exercises, list):
+        return None
+    lookup = _strength_exercise_lookup()
+    category_fallback = None
+    for exercise in exercises:
+        if not isinstance(exercise, dict):
+            continue
+        category = str(exercise.get("category") or "").upper()
+        name = str(exercise.get("name") or "").upper()
+        if category and category != "UNKNOWN" and name:
+            return lookup.get((category, name)) or name.replace("_", " ").title()
+        probability = exercise.get("probability")
+        if category and category != "UNKNOWN" and isinstance(probability, (int, float)) and probability > 0:
+            category_fallback = category.replace("_", " ").title()
+    return category_fallback
+
+
+def _normalise_garmin_strength_sets(payload):
+    """Keep editable non-rest Garmin sets and convert Garmin grams to kilograms."""
+    if isinstance(payload, dict):
+        rows = payload.get("exerciseSets") or []
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        rows = []
+    normalised = []
+    for source_index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        set_type = str(row.get("setType") or "ACTIVE").upper()
+        if set_type == "REST":
+            continue
+        message_index = row.get("messageIndex")
+        stable_index = message_index if isinstance(message_index, int) and message_index >= 0 else source_index
+        weight_grams = row.get("weight")
+        weight_kg = round(float(weight_grams) / 1000.0, 3) if isinstance(weight_grams, (int, float)) else None
+        reps = row.get("repetitionCount")
+        reps = int(reps) if isinstance(reps, (int, float)) and float(reps).is_integer() else None
+        normalised.append({
+            "id": f"garmin:{stable_index}",
+            "source": "garmin",
+            "garminIndex": stable_index,
+            "setType": set_type,
+            "startTime": row.get("startTime"),
+            "durationSeconds": round(row.get("duration"), 1) if isinstance(row.get("duration"), (int, float)) else None,
+            "exercise": _exercise_label(row.get("exercises")),
+            "reps": reps,
+            "weightKg": weight_kg,
+            "perSide": False,
+        })
+    return normalised
+
+
+def _apply_strength_entry(base_sets, entry):
+    overrides = entry.get("overrides") if isinstance(entry, dict) else {}
+    overrides = overrides if isinstance(overrides, dict) else {}
+    effective = []
+    for raw in base_sets:
+        row = dict(raw)
+        override = overrides.get(raw["id"])
+        if isinstance(override, dict):
+            for field in ("exercise", "reps", "durationSeconds", "weightKg", "perSide", "setType"):
+                if field in override:
+                    row[field] = override[field]
+        row.update({
+            "rawExercise": raw.get("exercise"),
+            "rawReps": raw.get("reps"),
+            "rawDurationSeconds": raw.get("durationSeconds"),
+            "rawWeightKg": raw.get("weightKg"),
+            "edited": any(row.get(field) != raw.get(field) for field in ("exercise", "reps", "durationSeconds", "weightKg", "perSide")),
+        })
+        effective.append(row)
+    manual = (entry.get("manualSets") or []) if isinstance(entry, dict) else []
+    effective.extend(dict(row) for row in manual if isinstance(row, dict))
+    return effective
+
+
+def _strength_activity_payload(client, activity_id):
+    activity_id = _strength_activity_id(activity_id)
+    warning = None
+    try:
+        raw_sets = _normalise_garmin_strength_sets(client.get_activity_exercise_sets(activity_id))
+    except Exception:  # noqa: BLE001 - saved snapshot still allows editing during Garmin outages
+        raw_sets = []
+        warning = "Garmin could not be reached. Showing the last saved set details."
+    with _STRENGTH_LOG_LOCK:
+        entry = _read_strength_log_unlocked().get("activities", {}).get(str(activity_id), {})
+    if not raw_sets:
+        raw_sets = [dict(row) for row in entry.get("lastGarminSets", []) if isinstance(row, dict)]
+    effective = _apply_strength_entry(raw_sets, entry)
+    recent = []
+    with _STRENGTH_LOG_LOCK:
+        store = _read_strength_log_unlocked()
+    ordered_entries = sorted(store.get("activities", {}).values(), key=lambda row: row.get("updatedAt") or "", reverse=True)
+    for saved in ordered_entries:
+        for row in _apply_strength_entry(saved.get("lastGarminSets", []), saved):
+            name = row.get("exercise")
+            if name and name not in recent:
+                recent.append(name)
+    return {
+        "activityId": activity_id,
+        "sets": effective,
+        "garminSetCount": len(raw_sets),
+        "exercises": _strength_exercise_catalog(),
+        "recentExercises": recent[:12],
+        "savedAt": entry.get("updatedAt"),
+        "warning": warning,
+    }
+
+
+def _validated_strength_set(row, source, position):
+    if not isinstance(row, dict):
+        raise ValueError("each strength set must be an object")
+    set_id = _strength_text(row.get("id"), "set id", 80)
+    expected_prefix = "garmin:" if source == "garmin" else "manual:"
+    if not set_id or not set_id.startswith(expected_prefix):
+        raise ValueError(f"invalid {source} set id")
+    result = {
+        "id": set_id,
+        "source": source,
+        "setType": (_strength_text(row.get("setType"), "set type", 30) or "ACTIVE").upper(),
+        "exercise": _strength_text(row.get("exercise")),
+        "reps": _strength_number(row.get("reps"), "repetitions", 0, 999, integer=True),
+        "durationSeconds": _strength_number(row.get("durationSeconds"), "duration", 0, 86400),
+        "weightKg": _strength_number(row.get("weightKg"), "weight", 0, 1000),
+        "perSide": bool(row.get("perSide")),
+    }
+    if source == "garmin":
+        result.update({
+            "garminIndex": _strength_number(row.get("garminIndex", position), "Garmin set index", 0, 10000, integer=True),
+            "startTime": _strength_text(row.get("startTime"), "start time", 50),
+        })
+    else:
+        if (result["exercise"] is None and result["reps"] is None
+                and result["durationSeconds"] is None and result["weightKg"] is None):
+            return None
+        if result["exercise"] is None:
+            raise ValueError("manual sets need an exercise")
+        if result["reps"] is None and not result["durationSeconds"]:
+            raise ValueError("manual sets need repetitions or a duration")
+    return result
+
+
+def _save_strength_activity(activity_id, payload, current_garmin_sets=None):
+    activity_id = _strength_activity_id(activity_id)
+    if not isinstance(payload, dict) or not isinstance(payload.get("sets"), list):
+        raise ValueError("a list of strength sets is required")
+    if len(payload["sets"]) > 200:
+        raise ValueError("a workout cannot contain more than 200 sets")
+    garmin_sets, manual_sets, overrides = [], [], {}
+    current_by_id = {
+        row.get("id"): row for row in (current_garmin_sets or [])
+        if isinstance(row, dict) and row.get("source") == "garmin" and row.get("id")
+    }
+    seen = set()
+    for position, submitted in enumerate(payload["sets"]):
+        source = submitted.get("source") if isinstance(submitted, dict) else None
+        if source not in {"garmin", "manual"}:
+            raise ValueError("set source must be garmin or manual")
+        effective = _validated_strength_set(submitted, source, position)
+        if effective is None:
+            continue
+        if effective["id"] in seen:
+            raise ValueError("set ids must be unique")
+        seen.add(effective["id"])
+        if source == "manual":
+            manual_sets.append(effective)
+            continue
+        current = current_by_id.get(effective["id"])
+        raw = _validated_strength_set(current if current is not None else {
+            **submitted,
+            "exercise": submitted.get("rawExercise"),
+            "reps": submitted.get("rawReps"),
+            "durationSeconds": submitted.get("rawDurationSeconds"),
+            "weightKg": submitted.get("rawWeightKg"),
+            "perSide": False,
+        }, "garmin", position)
+        garmin_sets.append(raw)
+        overrides[effective["id"]] = {field: effective.get(field) for field in ("exercise", "reps", "durationSeconds", "weightKg", "perSide", "setType")}
+    entry = {
+        "activityId": activity_id,
+        "activityName": _strength_text(payload.get("activityName"), "activity name"),
+        "activityStart": _strength_text(payload.get("activityStart"), "activity start", 50),
+        "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "lastGarminSets": garmin_sets,
+        "overrides": overrides,
+        "manualSets": manual_sets,
+    }
+    with _STRENGTH_LOG_LOCK:
+        store = _read_strength_log_unlocked()
+        store["activities"][str(activity_id)] = entry
+        _write_strength_log_unlocked(store)
+    try:
+        _recommendation_cache_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+    return entry
+
+
+def _strength_summary(limit=8):
+    with _STRENGTH_LOG_LOCK:
+        store = _read_strength_log_unlocked()
+    entries = sorted(
+        store.get("activities", {}).values(),
+        key=lambda row: row.get("activityStart") or row.get("updatedAt") or "",
+        reverse=True,
+    )[:limit]
+    activities = []
+    for entry in entries:
+        sets = []
+        volume, timed_seconds, timed_sets = 0.0, 0.0, 0
+        for row in _apply_strength_entry(entry.get("lastGarminSets", []), entry):
+            if not any(row.get(field) is not None for field in ("exercise", "reps", "durationSeconds", "weightKg")):
+                continue
+            clean = {field: row.get(field) for field in ("exercise", "reps", "durationSeconds", "weightKg", "perSide", "source", "setType")}
+            sets.append(clean)
+            if isinstance(clean["reps"], int) and isinstance(clean["weightKg"], (int, float)):
+                volume += clean["reps"] * clean["weightKg"] * (2 if clean["perSide"] else 1)
+            if (clean["reps"] is None and isinstance(clean["durationSeconds"], (int, float))
+                    and clean["durationSeconds"] > 0):
+                timed_sets += 1
+                timed_seconds += clean["durationSeconds"] * (2 if clean["perSide"] else 1)
+        activities.append({
+            "activityId": entry.get("activityId"),
+            "name": entry.get("activityName"),
+            "start": entry.get("activityStart"),
+            "workingSets": len(sets),
+            "externalLoadVolumeKg": round(volume, 1),
+            "timedSets": timed_sets,
+            "timedSeconds": round(timed_seconds, 1),
+            "sets": sets,
+        })
+    return {"activities": activities}
+
+
+def _strength_muscles(exercise):
+    """Map an exercise name to primary and assisting muscle groups."""
+    name = str(exercise or "").lower().replace("_", " ").replace("-", " ")
+    if not name:
+        return (), ()
+    if any(term in name for term in ("anti rotation", "pallof")):
+        return ("core",), ("delts", "glutes")
+    if "plank" in name:
+        return ("core",), ("delts", "glutes")
+    if any(term in name for term in ("crunch", "oblique", "ab ", "core")):
+        return ("core",), ()
+    if any(term in name for term in ("deadbug", "windshield wiper", "spinal twist", "hip crossover", "slide out", "walkout")):
+        return ("core",), ("delts", "glutes")
+    if any(term in name for term in ("bulgarian", "split squat", "lunge", "step up", "stepup")):
+        return ("quads", "glutes"), ("hamstrings", "core")
+    if any(term in name for term in ("leg curl", "hamstring curl", "nordic curl")):
+        return ("hamstrings",), ("glutes",)
+    if any(term in name for term in ("deadlift", "good morning", "kettlebell swing")):
+        return ("hamstrings", "glutes"), ("back", "core")
+    if any(term in name for term in ("hip thrust", "glute bridge", "kickback", "hip abduction", "clam shell")):
+        return ("glutes",), ("hamstrings", "core")
+    if any(term in name for term in ("donkey kick", "fire hydrant", "hip extension", "leg abduction", "leg adduction", "band walk")):
+        return ("glutes",), ("hamstrings", "core")
+    if "calf" in name:
+        return ("calves",), ()
+    if "leg extension" in name:
+        return ("quads",), ()
+    if any(term in name for term in ("squat", "leg press")):
+        return ("quads", "glutes"), ("hamstrings", "core")
+    if any(term in name for term in ("bench press", "chest press", "chest fly", "push up", "pushup", "dip")):
+        return ("chest",), ("triceps", "delts")
+    if any(term in name for term in ("shoulder press", "military press", "overhead press", "arnold press")):
+        return ("delts",), ("triceps", "core")
+    if any(term in name for term in ("lateral raise", "front raise", "rear delt", "reverse fly")):
+        return ("delts",), ()
+    if any(term in name for term in ("external rotation", "internal rotation", "pull apart", "shoulder abduction", "shoulder extension", "shoulder flexion", "wall crawl")):
+        return ("delts",), ("back", "core")
+    if any(term in name for term in ("pull up", "pullup", "chin up", "chinup", "lat pull", "pulldown", "pull down", " row")) or name.startswith("row"):
+        return ("back",), ("biceps", "delts")
+    if "latpull" in name:
+        return ("back",), ("biceps", "delts")
+    if any(term in name for term in ("biceps", "bicep", " curl")) or name.startswith("curl"):
+        return ("biceps",), ()
+    if any(term in name for term in ("triceps", "tricep", "pressdown", "pushdown", "skull crusher")):
+        return ("triceps",), ()
+    if any(term in name for term in ("clean", "snatch", "thruster")):
+        return ("quads", "glutes", "delts"), ("hamstrings", "back", "core")
+    if "farmer" in name or "suitcase" in name or "carry" in name:
+        return ("core",), ("delts", "back")
+    if "dead hang" in name:
+        return ("back",), ("delts", "biceps")
+    if "wall sit" in name:
+        return ("quads",), ("glutes", "core")
+    if any(term in name for term in ("jump rope", "double under", "triple under", "jumping jack", "split jack", "ski mogul", "bob and weave")):
+        return ("calves", "quads"), ("glutes", "core")
+    if "back extension" in name:
+        return ("back", "glutes"), ("hamstrings", "core")
+    if name in {"banded fly", "weighted banded fly"}:
+        return ("chest",), ("delts",)
+    if "opposite arm and leg balance" in name:
+        return ("core", "glutes"), ("delts", "back")
+    category = _strength_category_lookup().get(str(exercise or "").casefold())
+    return _GARMIN_CATEGORY_MUSCLES.get(category, ((), ()))
+
+
+def _exercise_muscle_profile(exercise):
+    primary, secondary = _strength_muscles(exercise)
+    labels = dict(_MUSCLE_GROUPS)
+    muscles = [
+        {"key": key, "label": labels[key], "role": "primary", "volumeCreditPct": 100}
+        for key in primary
+    ]
+    muscles.extend(
+        {"key": key, "label": labels[key], "role": "assisting", "volumeCreditPct": 50}
+        for key in secondary if key not in primary
+    )
+    return {"exercise": str(exercise or ""), "muscles": muscles, "mapped": bool(muscles)}
+
+
+def _cardio_mode(activity):
+    text = f"{activity.get('typeKey') or ''} {activity.get('name') or ''}".lower().replace("_", " ")
+    if "ski erg" in text or "skierg" in text:
+        return "skierg"
+    if "row" in text:
+        return "rowing"
+    if "ellipt" in text or "cross trainer" in text:
+        return "elliptical"
+    if any(term in text for term in ("stair", "floor climb", "step machine")):
+        return "stairs"
+    sport = activity.get("sport")
+    return sport if sport in {"run", "bike", "walk", "swim"} else None
+
+
+def _payload_date(row):
+    if not isinstance(row, dict):
+        return None
+    for key in ("calendarDate", "date", "startDate", "start"):
+        value = row.get(key)
+        if value:
+            try:
+                return datetime.date.fromisoformat(str(value)[:10])
+            except ValueError:
+                continue
+    return None
+
+
+def _week_label(start, end):
+    def short(value):
+        return value.strftime("%b %d").replace(" 0", " ")
+    return f"{short(start)}–{short(end)}"
+
+
+def _muscle_volume_weeks(strength, activities, daily_steps, daily_stats, today, week_count=12):
+    """Estimate weekly direct sets and conservative indirect/cardio exposure."""
+    current_start = today - datetime.timedelta(days=today.weekday())
+    starts = [current_start - datetime.timedelta(weeks=offset) for offset in range(week_count - 1, -1, -1)]
+    buckets = {}
+    muscle_order = {key: index for index, (key, _label) in enumerate(_MUSCLE_GROUPS)}
+    for start in starts:
+        values = {key: {"direct": 0.0, "secondary": 0.0, "cardio": 0.0, "movement": 0.0}
+                  for key, _label in _MUSCLE_GROUPS}
+        buckets[start] = {
+            "weekStart": start.isoformat(),
+            "weekEnd": (start + datetime.timedelta(days=6)).isoformat(),
+            "label": _week_label(start, start + datetime.timedelta(days=6)),
+            "isCurrent": start == current_start,
+            "values": values,
+            "exerciseMap": {},
+            "sources": {"strengthSets": 0, "unclassifiedSets": 0, "cardioSessions": 0,
+                        "cardioMinutes": 0, "steps": 0, "floors": 0, "movementDays": 0},
+        }
+
+    def bucket_for(value):
+        date = _payload_date(value) if isinstance(value, dict) else None
+        if date is None and value:
+            try:
+                date = datetime.date.fromisoformat(str(value)[:10])
+            except ValueError:
+                return None
+        if date is None:
+            return None
+        start = date - datetime.timedelta(days=date.weekday())
+        return buckets.get(start)
+
+    for activity in (strength or {}).get("activities", []):
+        bucket = bucket_for(activity.get("start")) if isinstance(activity, dict) else None
+        if not bucket:
+            continue
+        for row in activity.get("sets", []):
+            if not isinstance(row, dict) or str(row.get("setType") or "ACTIVE").upper() in {"REST", "WARMUP"}:
+                continue
+            exercise = row.get("exercise") or "Unspecified exercise"
+            profile = _exercise_muscle_profile(exercise)
+            primary = tuple(item["key"] for item in profile["muscles"] if item["role"] == "primary")
+            secondary = tuple(item["key"] for item in profile["muscles"] if item["role"] == "assisting")
+            exercise_row = bucket["exerciseMap"].setdefault(exercise, {**profile, "sets": 0})
+            exercise_row["sets"] += 1
+            if not primary:
+                bucket["sources"]["unclassifiedSets"] += 1
+                continue
+            bucket["sources"]["strengthSets"] += 1
+            for muscle in primary:
+                bucket["values"][muscle]["direct"] += 1.0
+            for muscle in secondary:
+                bucket["values"][muscle]["secondary"] += .5
+
+    for activity in activities or []:
+        if not isinstance(activity, dict) or activity.get("isStrength"):
+            continue
+        bucket, mode = bucket_for(activity.get("date") or activity.get("start")), _cardio_mode(activity)
+        minutes = activity.get("min")
+        if not bucket or not mode or not isinstance(minutes, (int, float)) or minutes <= 0:
+            continue
+        zones = activity.get("zones") or []
+        zone_total = sum(value for value in zones if isinstance(value, (int, float)))
+        hard_minutes = sum(value for value in zones[2:] if isinstance(value, (int, float)))
+        intensity = 1.0 + min(.35, hard_minutes / zone_total * .35) if zone_total else 1.0
+        units = min(float(minutes) / 20.0, 3.5) * intensity
+        bucket["sources"]["cardioSessions"] += 1
+        bucket["sources"]["cardioMinutes"] += round(minutes)
+        for muscle, factor in _CARDIO_MUSCLE_FACTORS[mode].items():
+            bucket["values"][muscle]["cardio"] += units * factor
+
+    steps_by_week = {}
+    for row in daily_steps or []:
+        date = _payload_date(row)
+        if date is None:
+            continue
+        start = date - datetime.timedelta(days=date.weekday())
+        steps = _find_num(row, ("totalSteps", "steps")) or 0
+        steps_by_week[start] = steps_by_week.get(start, 0) + max(0, steps)
+    floors_by_week, movement_days = {}, {}
+    for row in daily_stats or []:
+        date = _payload_date(row)
+        if date is None:
+            continue
+        start = date - datetime.timedelta(days=date.weekday())
+        floors = _find_num(row, ("floorsAscended", "floors")) or 0
+        floors_by_week[start] = floors_by_week.get(start, 0) + max(0, floors)
+        movement_days[start] = movement_days.get(start, 0) + 1
+
+    for start, bucket in buckets.items():
+        steps, floors = steps_by_week.get(start, 0), floors_by_week.get(start, 0)
+        bucket["sources"].update({"steps": round(steps), "floors": round(floors),
+                                  "movementDays": movement_days.get(start, 0)})
+        step_units, floor_units = min(3.0, steps / 35000.0), min(2.0, floors / 60.0)
+        for muscle, factor in {"quads": .30, "glutes": .25, "hamstrings": .15, "calves": .35, "core": .08}.items():
+            bucket["values"][muscle]["movement"] += step_units * factor
+        for muscle, factor in {"quads": .35, "glutes": .50, "hamstrings": .15, "calves": .20, "core": .08}.items():
+            bucket["values"][muscle]["movement"] += floor_units * factor
+
+    weeks = []
+    for start in starts:
+        bucket = buckets[start]
+        muscles = []
+        for key, label in _MUSCLE_GROUPS:
+            values = bucket["values"][key]
+            indirect = values["secondary"] + values["cardio"] + values["movement"]
+            muscles.append({
+                "key": key, "label": label,
+                "direct": round(values["direct"], 1),
+                "indirectStrength": round(values["secondary"], 1),
+                "cardio": round(values["cardio"], 1),
+                "movement": round(values["movement"], 1),
+                "indirect": round(indirect, 1),
+                "total": round(values["direct"] + indirect, 1),
+            })
+        muscles.sort(key=lambda row: (-row["total"], muscle_order[row["key"]]))
+        bucket.pop("values")
+        exercise_rows = list(bucket.pop("exerciseMap").values())
+        exercise_rows.sort(key=lambda row: (-row["sets"], row["exercise"].casefold()))
+        bucket["exerciseBreakdown"] = exercise_rows
+        bucket["muscles"] = muscles
+        weeks.append(bucket)
+    return {
+        "weeks": weeks,
+        "currentIndex": len(weeks) - 1,
+        "formula": (
+            "Direct volume is completed working sets for primary muscles. The lighter total adds 0.5 for "
+            "assisting muscles plus conservative, capped exposure from cardio, steps and recorded floors. "
+            "It is a planning estimate—not a claim that cardio minutes equal hypertrophy sets."
+        ),
+    }
+
+
 def _cached_recommendation(date):
     try:
         payload = json.loads(_recommendation_cache_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return None
-    return payload if payload.get("date") == date and payload.get("text") else None
+    return payload if (payload.get("date") == date and payload.get("text")
+                       and payload.get("promptVersion") == _RECOMMENDATION_PROMPT_VERSION) else None
 
 
 def _save_recommendation(date, recommendation):
     target = _recommendation_cache_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {"date": date, "text": recommendation["text"], "model": recommendation["model"],
+               "promptVersion": _RECOMMENDATION_PROMPT_VERSION,
                "savedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()}
     temporary = target.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload), encoding="utf-8")
@@ -150,8 +980,16 @@ def _body_measurements():
     """Read Basic-Fit measurements and expose each latest value and change."""
     records = []
     try:
-        with _ensure_body_measurements_file().open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
+        db = _dashboard_database()
+        if db:
+            rows = ({"timestamp": row[0].isoformat(), "weight_kg": row[1], "fat_pct": row[2],
+                     "muscle_pct": row[3], "bone_pct": row[4], "body_water_pct": row[5],
+                     "source": row[6]} for row in db.body_measurements())
+        else:
+            handle = _ensure_body_measurements_file().open(newline="", encoding="utf-8")
+            rows = csv.DictReader(handle)
+        try:
+            for row in rows:
                 timestamp = row.get("timestamp")
                 if not timestamp:
                     continue
@@ -166,6 +1004,9 @@ def _body_measurements():
                     except ValueError:
                         record[field] = None
                 records.append(record)
+        finally:
+            if not db:
+                handle.close()
     except OSError:
         return {"records": [], "metrics": {}}
     records.sort(key=lambda item: item["timestamp"])
@@ -198,10 +1039,14 @@ def _append_body_measurement(payload):
                 raise ValueError(f"{field} must be a number") from exc
     if not any(row[field] != "" for field in _BODY_FIELDS):
         raise ValueError("provide at least one body measurement")
-    target = _ensure_body_measurements_file()
-    with target.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("timestamp", "weight_kg", "fat_pct", "muscle_pct", "bone_pct", "body_water_pct", "source"))
-        writer.writerow(row)
+    db = _dashboard_database()
+    if db:
+        db.add_body_measurement(row)
+    else:
+        target = _ensure_body_measurements_file()
+        with target.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=("timestamp", "weight_kg", "fat_pct", "muscle_pct", "bone_pct", "body_water_pct", "source"))
+            writer.writerow(row)
 
 
 def _injury_measurements(days=30):
@@ -211,7 +1056,11 @@ def _injury_measurements(days=30):
     by_date = {}
     target = _injury_measurements_path()
     try:
-        if target.exists():
+        db = _dashboard_database()
+        if db:
+            for values in db.injury_measurements(start, today):
+                by_date[values[0]] = dict(zip(_INJURY_FIELDS, values[1:]))
+        elif target.exists():
             with target.open(newline="", encoding="utf-8") as handle:
                 for row in csv.DictReader(handle):
                     try:
@@ -255,6 +1104,10 @@ def _append_injury_measurement(payload):
             raise ValueError("pain scores must be whole numbers from 0 to 10")
         row[field] = int(value)
 
+    db = _dashboard_database()
+    if db:
+        db.upsert_injury_measurement(row)
+        return
     target = _injury_measurements_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     existing = []
@@ -347,6 +1200,11 @@ def _sport_of(type_key):
     return "other"
 
 
+def _is_strength_type(type_key):
+    key = (type_key or "").lower()
+    return key == "strength_training" or "strength" in key
+
+
 def _map_activity(a):
     at = (a.get("activityType") or {}).get("typeKey")
     sport = _sport_of(at)
@@ -365,8 +1223,10 @@ def _map_activity(a):
     sport_multiplier = {"run": 3.5, "bike": 2.0, "swim": 1.8, "other": 1.7, "walk": 1.0}.get(sport, 1.7)
     effort = round(effort_base * sport_multiplier, 1)
     return {
+        "activityId": a.get("activityId"),
         "sport": sport,
         "typeKey": at,
+        "isStrength": _is_strength_type(at),
         "name": a.get("activityName") or "Activity",
         "date": (a.get("startTimeLocal") or "")[:10],
         "start": a.get("startTimeLocal"),
@@ -382,6 +1242,9 @@ def _map_activity(a):
         "effortBase": round(effort_base, 1) if sum(zones) else None,
         "effortMultiplier": sport_multiplier,
         "location": a.get("locationName"),
+        "totalSets": _num(a.get("totalSets")),
+        "totalReps": _num(a.get("totalReps")),
+        "totalVolumeGrams": _num(a.get("totalVolume")),
     }
 
 
@@ -660,8 +1523,15 @@ def gather(client):
     raw = _call(client.get_activities, 0, 40) or []
     acts = [_map_activity(a) for a in raw if isinstance(a, dict)]
     out["recent"] = acts[:12]
+    strength_history = _strength_summary(limit=200)
+    out["strength"] = {"activities": strength_history["activities"][:8]}
     history = _history_activities(client, today)
     out["fitnessSeries"] = _training_history(history, today)
+    muscle_start = today - datetime.timedelta(days=today.weekday(), weeks=11)
+    daily_steps = _call(client.get_daily_steps, muscle_start.isoformat(), ds) or daily_stats
+    out["muscleVolume"] = _muscle_volume_weeks(
+        strength_history, history, daily_steps, daily_stats, today,
+    )
 
     def within(dstr, days):
         try:
@@ -766,6 +1636,7 @@ def gather(client):
         }
 
     gym_acts = [a for a in acts if a["sport"] == "other"]
+    strength_acts = [a for a in gym_acts if a.get("isStrength")]
     type_counts = {}
     for activity in gym_acts:
         label = activity.get("name") or (activity.get("typeKey") or "Workout").replace("_", " ").title()
@@ -775,6 +1646,7 @@ def gather(client):
         "week": _agg([a for a in gym_acts if within(a["date"], 7)]),
         "month": _agg([a for a in gym_acts if within(a["date"], 30)]),
         "last": gym_acts[0] if gym_acts else None,
+        "lastStrength": strength_acts[0] if strength_acts else None,
         "types": [{"name": name, "count": count} for name, count in sorted(type_counts.items(), key=lambda item: -item[1])[:4]],
     }
 
@@ -814,6 +1686,21 @@ def add_dashboard_routes(asgi_app, client):
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(_injury_measurements(), status_code=201)
 
+    async def strength_activity(request):
+        if client is None:
+            return JSONResponse({"error": "garmin client not ready"}, status_code=503)
+        try:
+            activity_id = _strength_activity_id(request.path_params.get("activity_id"))
+            if request.method == "POST":
+                try:
+                    current_sets = _normalise_garmin_strength_sets(client.get_activity_exercise_sets(activity_id))
+                except Exception:  # noqa: BLE001 - saved/browser snapshot supports offline correction
+                    current_sets = None
+                _save_strength_activity(activity_id, await request.json(), current_sets)
+            return JSONResponse(_strength_activity_payload(client, activity_id), status_code=201 if request.method == "POST" else 200)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
     async def recommendation(request):
         """Serve today's saved advice, unless the athlete explicitly asks to refresh it."""
         try:
@@ -836,6 +1723,7 @@ def add_dashboard_routes(asgi_app, client):
         except (ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except RuntimeError as exc:
+            print(f"garmin-mcp: recommendation request failed: {exc}")
             return JSONResponse({"error": str(exc)}, status_code=503)
         except requests.RequestException:
             return JSONResponse({"error": "The recommendation service is temporarily unavailable."}, status_code=503)
@@ -850,6 +1738,7 @@ def add_dashboard_routes(asgi_app, client):
     asgi_app.router.routes.append(Route("/api/dashboard", api, methods=["GET"]))
     asgi_app.router.routes.append(Route("/api/body-measurements", body_measurements, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/injury-measurements", injury_measurements, methods=["GET", "POST"]))
+    asgi_app.router.routes.append(Route("/api/strength-activities/{activity_id:int}", strength_activity, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/recommendation", recommendation, methods=["POST"]))
     asgi_app.router.routes.append(Route("/dashboard", page, methods=["GET"]))
     asgi_app.router.routes.append(Route("/favicon.ico", favicon, methods=["GET"]))
@@ -906,12 +1795,13 @@ button.rf:hover{border-color:var(--accent)}
 button.rf svg{width:15px;height:15px}
 .read{background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 12%,var(--surface)),var(--surface));
   border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:15px 18px;margin-bottom:18px;display:flex;gap:13px}
-.read .em{font-size:22px}.read p{margin:0;font-size:14.5px;flex:1}.read b{color:var(--text)}.read button{align-self:center;white-space:nowrap}.read button:disabled{opacity:.65;cursor:wait}
+.read .em{font-size:22px}.read p{margin:0;font-size:14.5px;flex:1;white-space:pre-line}.read b{color:var(--text)}.read button{align-self:flex-start;white-space:nowrap}.read button:disabled{opacity:.65;cursor:wait}
 .grid{display:grid;gap:14px}
 .hero{grid-template-columns:1.5fr 1fr 1fr}.topmetrics{grid-template-columns:repeat(3,1fr);margin-top:14px}.bodygrid{grid-template-columns:repeat(4,1fr);margin-top:14px}
 .tri{grid-template-columns:repeat(3,1fr);margin-top:14px}
 .stats{grid-template-columns:repeat(4,1fr);margin-top:14px}
 @media(max-width:820px){.hero,.tri,.topmetrics{grid-template-columns:1fr 1fr}.stats,.bodygrid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px){.read{flex-wrap:wrap}.read .em{display:none}.read p{min-width:100%}.read button{margin-left:0}}
 @media(max-width:520px){.hero,.tri,.topmetrics,.bodygrid{grid-template-columns:1fr}}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px;min-width:0}
 .card .label{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
@@ -977,6 +1867,12 @@ button.rf svg{width:15px;height:15px}
 .effortdetail{margin-top:14px;padding-top:13px;border-top:1px solid var(--border)}.effortdaily{width:100%;height:120px;display:block;margin-top:4px;cursor:crosshair}.effortlist{display:grid;gap:7px;margin-top:12px}.effortrow{display:flex;justify-content:space-between;gap:14px;padding:9px 11px;border-radius:10px;background:var(--surface-2);font-size:12.5px;color:var(--muted)}.effortrow b{color:var(--text)}.effortrow .score{white-space:nowrap;color:var(--accent);font-weight:750}.fitsummary{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-top:12px}.fitsummary .change{font-size:28px;font-weight:800}.fitsummary .up{color:var(--good)}.fitsummary .period{width:100%;color:var(--muted);font-size:12.5px}
 .entry-actions{display:flex;justify-content:flex-end;margin-top:14px}.entry-form{display:none;margin-top:14px;padding:15px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2)}.entry-form.open{display:block}.entry-fields{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.injury-fields{grid-template-columns:repeat(3,1fr)}.entry-fields label{display:grid;gap:4px;font-size:12px;font-weight:700;color:var(--muted)}.entry-fields input{width:100%;border:1px solid var(--border);border-radius:9px;padding:9px;background:var(--surface);color:var(--text);font:inherit}.entry-submit{margin-top:12px;border:0;border-radius:999px;background:var(--accent);color:white;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer}.entry-status{margin:9px 0 0;font-size:12px;color:var(--muted)}.injurychart{width:100%;height:300px;display:block;margin-top:10px}.painlegend{display:flex;flex-wrap:wrap;gap:7px 14px;margin-top:12px;font-size:12px;color:var(--muted)}.painlegend span{display:flex;align-items:center;gap:5px}.painlegend i{width:9px;height:9px;border-radius:50%;display:inline-block}.pain-scale{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
 @media(max-width:640px){.entry-fields,.injury-fields{grid-template-columns:1fr 1fr}.injurychart{height:240px}.primarychart{height:250px}.loadchart text,.effortdaily text{font-size:21px!important}}@media(max-width:420px){.entry-fields,.injury-fields{grid-template-columns:1fr}}
+.strength-open{display:inline-flex;align-items:center;margin-top:5px;border:0;background:transparent;color:var(--accent);padding:2px 0;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer}.strength-card-action{margin-top:12px;width:100%;justify-content:center!important;box-shadow:none!important;background:var(--surface-2)!important}
+.strength-modal[hidden]{display:none}.strength-modal{position:fixed;inset:0;z-index:50;background:rgba(5,12,22,.64);display:grid;place-items:center;padding:18px}.strength-dialog{width:min(720px,100%);max-height:calc(100dvh - 36px);display:flex;flex-direction:column;background:var(--bg);border:1px solid var(--border);border-radius:20px;box-shadow:0 24px 70px rgba(0,0,0,.35);overflow:hidden}.strength-dialog-head,.strength-dialog-foot{background:var(--surface);padding:14px 17px;display:flex;align-items:center;justify-content:space-between;gap:12px}.strength-dialog-head{border-bottom:1px solid var(--border)}.strength-dialog-head h2{font-size:18px;margin:0}.strength-dialog-head p{font-size:12px;color:var(--muted);margin:2px 0 0}.strength-dialog-foot{border-top:1px solid var(--border);justify-content:flex-end}.strength-dialog-body{padding:14px;overflow:auto;overscroll-behavior:contain}.strength-close{width:44px;height:44px;border:1px solid var(--border);border-radius:50%;background:var(--surface-2);color:var(--text);font-size:22px;cursor:pointer}.strength-save{border:0;border-radius:999px;background:var(--accent);color:#fff;padding:10px 16px;min-height:44px;font:inherit;font-weight:700;cursor:pointer}.strength-save:disabled{opacity:.65;cursor:wait}.strength-banner{padding:10px 12px;border-radius:11px;background:color-mix(in srgb,var(--accent) 12%,var(--surface));color:var(--muted);font-size:12.5px;margin-bottom:12px}.strength-banner.warn{background:color-mix(in srgb,var(--warn) 13%,var(--surface));color:var(--warn)}.strength-editor-title{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:17px 2px 8px}.strength-editor-title:first-child{margin-top:0}.strength-editor-title h3{margin:0;font-size:14px}.strength-editor-title p{margin:2px 0 0;font-size:11.5px;color:var(--muted)}.strength-set-list,.strength-manual-list{display:grid;gap:8px}.strength-set-row,.strength-manual-group{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:11px}.strength-set-meta,.strength-manual-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.strength-set-meta b,.strength-manual-head b{font-size:12.5px}.strength-set-meta span,.strength-manual-head span{font-size:11px;color:var(--muted)}.strength-fields{display:grid;grid-template-columns:minmax(170px,1fr) 78px 82px 92px;gap:8px;align-items:end}.strength-field{display:grid;gap:4px;min-width:0;color:var(--muted);font-size:11px;font-weight:700}.strength-field input{width:100%;min-width:0;border:1px solid var(--border);border-radius:9px;padding:9px;background:var(--surface-2);color:var(--text);font:inherit;font-size:16px}.strength-field input.changed{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 7%,var(--surface))}.strength-row-actions{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:8px}.strength-per-side{display:flex;align-items:center;gap:7px;min-height:36px;font-size:12px;color:var(--muted);cursor:pointer}.strength-per-side input{width:18px;height:18px}.strength-apply,.strength-add,.strength-remove,.strength-copy{border:1px solid var(--border);border-radius:999px;background:var(--surface-2);color:var(--text);padding:7px 10px;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer}.strength-add{min-height:40px}.strength-remove{border-color:transparent;background:transparent;color:var(--low)}.strength-original{font-size:11px;color:var(--faint);margin:6px 0 0}.strength-manual-sets{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.strength-manual-pair{min-width:0;padding:8px;border-radius:10px;background:var(--surface-2)}.strength-manual-set-head{display:flex;align-items:center;justify-content:space-between;gap:5px;margin-bottom:6px;font-size:11px}.strength-copy{padding:4px 7px;border-color:transparent;background:var(--surface);font-size:10px}.strength-manual-values{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.strength-manual-values .strength-field input{padding:8px 6px;background:var(--surface)}.strength-status{min-height:18px;margin:9px 2px 0;color:var(--muted);font-size:12px}.strength-empty{padding:18px;text-align:center;color:var(--muted);font-size:13px;background:var(--surface);border:1px dashed var(--border);border-radius:13px}.modal-open{overflow:hidden}
+@media(max-width:640px){.strength-modal{padding:0}.strength-dialog{width:100%;max-height:100dvh;height:100dvh;border:0;border-radius:0}.strength-dialog-body{padding:12px}.strength-fields{grid-template-columns:repeat(3,minmax(0,1fr))}.strength-fields .strength-exercise{grid-column:1/-1}.strength-manual-sets{grid-template-columns:1fr}.strength-dialog-foot>*{flex:1}.strength-open{min-height:32px}}
+@media(max-width:360px){.strength-fields{grid-template-columns:minmax(0,1fr) 64px 68px;gap:6px}.strength-set-row,.strength-manual-group{padding:9px}.strength-field input{padding:8px 6px}}
+.muscle-card{margin-top:14px}.muscle-card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.muscle-card-head h3{font-size:15px;margin:0}.muscle-card-head p{font-size:11.5px;color:var(--muted);margin:2px 0 0}.muscle-week-nav{display:flex;align-items:center;gap:8px}.muscle-week-nav button{width:38px;height:38px;border:1px solid var(--border);border-radius:50%;background:var(--surface-2);color:var(--text);font-size:22px;line-height:1;cursor:pointer}.muscle-week-nav button:disabled{opacity:.35;cursor:default}.muscle-week-label{min-width:128px;text-align:center;font-size:12px;font-weight:750}.muscle-summary{font-size:12px;color:var(--muted);margin:10px 0 2px}.muscle-chart-wrap{width:100%;overflow-x:auto;overscroll-behavior-inline:contain}.musclechart{width:100%;height:300px;display:block}.muscle-scroll-hint{display:none}.muscle-legend{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:12px;color:var(--muted);margin:5px 0 0}.muscle-legend span{display:flex;align-items:center;gap:6px}.muscle-legend i{display:inline-block;width:11px;height:11px;border-radius:3px}.muscle-map{margin-top:13px;border-top:1px solid var(--border);padding-top:11px}.muscle-map summary{cursor:pointer;font-size:12.5px;font-weight:750;color:var(--text)}.muscle-table-wrap{overflow:auto;margin-top:9px}.muscle-table{width:100%;border-collapse:collapse;font-size:12px}.muscle-table th,.muscle-table td{text-align:left;padding:8px;border-bottom:1px solid var(--border);vertical-align:top}.muscle-table th{color:var(--faint);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em}.muscle-table td:nth-child(2){font-weight:750;text-align:center}.muscle-credit{display:inline-block;margin:1px 4px 1px 0;padding:2px 6px;border-radius:999px;background:var(--surface-2);white-space:nowrap}.muscle-unmapped{color:var(--warn)}
+@media(max-width:520px){.musclechart{width:720px;height:260px}.muscle-scroll-hint{display:block;margin:1px 0 5px;color:var(--faint);font-size:10.5px;text-align:right}.muscle-week-nav{width:100%;justify-content:space-between}.muscle-week-label{flex:1}.muscle-table{min-width:590px}}
 .svg-tip{position:fixed;z-index:20;pointer-events:none;background:var(--text);color:var(--surface);padding:7px 9px;border-radius:8px;font-size:12px;line-height:1.35;box-shadow:var(--shadow);transform:translate(12px,-115%);white-space:nowrap}.svg-tip[hidden]{display:none}.bbchart,.trendchart,.loadchart{cursor:crosshair}
 .hrvdots{display:flex;align-items:flex-end;justify-content:space-between;gap:8px;height:96px;padding:8px 3px 0}.hrvday{flex:1;min-width:0;text-align:center;color:var(--faint);font-size:10.5px}.hrvdot{display:block;width:15px;height:15px;border-radius:50%;margin:0 auto 7px;background:var(--faint);box-shadow:0 0 0 4px color-mix(in srgb,var(--faint) 12%,transparent)}.hrvdot.good{background:var(--good);box-shadow:0 0 0 4px color-mix(in srgb,var(--good) 14%,transparent)}.hrvdot.warn{background:var(--warn);box-shadow:0 0 0 4px color-mix(in srgb,var(--warn) 14%,transparent)}.hrvdot.low{background:var(--low);box-shadow:0 0 0 4px color-mix(in srgb,var(--low) 14%,transparent)}
 .twogrid{grid-template-columns:1.4fr 1fr}
@@ -995,14 +1891,139 @@ footer{margin-top:26px;padding-top:15px;border-top:1px solid var(--border);color
 <script>
 var TOKEN = new URLSearchParams(location.search).get("token") || "";
 var ns="http://www.w3.org/2000/svg";
+var CURRENT_DASHBOARD=null,STRENGTH_STATE=null,STRENGTH_DIRTY=false,MUSCLE_STATE=null,MUSCLE_WEEK_INDEX=0;
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function el(t,c,h){var e=document.createElement(t);if(c)e.className=c;if(h!=null)e.innerHTML=h;return e;}
 function n(x,f){return (x==null)?"—":(f?f(x):x);}
 function comma(x){return x==null?"—":Math.round(x).toLocaleString();}
+function esc(x){return String(x==null?"":x).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+function inputNumber(value){return value==null?"":String(value);}
+function readStrengthNumber(input,label){var value=input.value.trim();if(value==="")return null;var number=Number(value);if(!Number.isFinite(number)||number<0)throw new Error(label+" must be zero or more");return number;}
+
+function ensureStrengthModal(){
+  var modal=document.getElementById("strength-modal");if(modal)return modal;
+  modal=el("div","strength-modal");modal.id="strength-modal";modal.hidden=true;
+  modal.innerHTML='<section class="strength-dialog" role="dialog" aria-modal="true" aria-labelledby="strength-dialog-title"><header class="strength-dialog-head"><div><h2 id="strength-dialog-title">Strength details</h2><p id="strength-dialog-meta"></p></div><button type="button" class="strength-close" data-strength-close aria-label="Close strength editor">×</button></header><div class="strength-dialog-body" id="strength-editor-content"></div><footer class="strength-dialog-foot"><button type="button" class="rf" data-strength-close>Close</button><button type="button" class="strength-save" id="strength-save">Save details</button></footer></section>';
+  document.body.appendChild(modal);
+  modal.querySelectorAll("[data-strength-close]").forEach(function(button){button.addEventListener("click",closeStrengthEditor);});
+  modal.querySelector("#strength-save").addEventListener("click",saveStrengthDetails);
+  modal.addEventListener("input",function(event){if(event.target.matches("input")){event.target.classList.add("changed");STRENGTH_DIRTY=true;setStrengthStatus("Unsaved changes");if(event.target.matches('[data-strength-field="perSide"]')){var label=event.target.closest("[data-strength-row]").querySelector("[data-strength-reps-label]");if(label)label.textContent=event.target.checked?"Reps/side":"Reps";}}});
+  modal.addEventListener("click",function(event){
+    var apply=event.target.closest("[data-strength-apply]");if(apply){applyExerciseToThree(apply.dataset.strengthApply);return;}
+    var copy=event.target.closest("[data-manual-copy]");if(copy){copyPreviousManualSet(copy);return;}
+    if(event.target.closest("[data-strength-add]")){addManualStrengthGroup();return;}
+    var remove=event.target.closest("[data-strength-remove]");if(remove){remove.closest(".strength-manual-group").remove();STRENGTH_DIRTY=true;setStrengthStatus("Manual exercise removed — save to confirm");return;}
+    if(event.target.closest("[data-strength-revert]")){revertGarminStrengthRows();}
+  });
+  return modal;
+}
+
+function setStrengthStatus(message,isError){var target=document.getElementById("strength-status");if(target){target.textContent=message||"";target.style.color=isError?"var(--low)":"";}}
+function closeStrengthEditor(){
+  var modal=document.getElementById("strength-modal");if(!modal)return;
+  if(STRENGTH_DIRTY&&!window.confirm("Close without saving these strength changes?"))return;
+  STRENGTH_DIRTY=false;modal.hidden=true;document.body.classList.remove("modal-open");
+}
+
+function strengthOriginalText(row){
+  var parts=[];if(row.rawExercise)parts.push(row.rawExercise);parts.push(row.rawReps==null?"no reps":row.rawReps+" reps");if(row.rawDurationSeconds!=null)parts.push(row.rawDurationSeconds+" sec");parts.push(row.rawWeightKg==null?"no weight":row.rawWeightKg+" kg");return "Garmin captured: "+parts.join(" · ");
+}
+
+function strengthGarminRow(row,index){
+  return '<div class="strength-set-row" data-strength-row data-set-id="'+esc(row.id)+'"><div class="strength-set-meta"><div><b>Set '+(index+1)+'</b> <span>'+esc(row.setType||"ACTIVE")+'</span></div><button type="button" class="strength-apply" data-strength-apply="'+esc(row.id)+'">Use for this + next 2</button></div><div class="strength-fields"><label class="strength-field strength-exercise">Exercise<input data-strength-field="exercise" list="strength-exercise-options" value="'+esc(row.exercise)+'" placeholder="Choose or type"></label><label class="strength-field"><span data-strength-reps-label>'+(row.perSide?"Reps/side":"Reps")+'</span><input data-strength-field="reps" type="number" inputmode="numeric" min="0" step="1" value="'+esc(inputNumber(row.reps))+'"></label><label class="strength-field">Seconds<input data-strength-field="durationSeconds" type="number" inputmode="decimal" min="0" max="86400" step="1" value="'+esc(inputNumber(row.durationSeconds))+'"></label><label class="strength-field">Weight · kg<input data-strength-field="weightKg" type="number" inputmode="decimal" min="0" max="1000" step="0.5" value="'+esc(inputNumber(row.weightKg))+'"></label></div><div class="strength-row-actions"><label class="strength-per-side"><input data-strength-field="perSide" type="checkbox" '+(row.perSide?"checked":"")+'> Reps/time are per side</label></div><p class="strength-original">'+esc(strengthOriginalText(row))+'</p></div>';
+}
+
+function manualGroupKey(row){var bits=String(row.id||"").split(":");return bits.length>2?bits.slice(0,-1).join(":"):String(row.id||"");}
+function strengthManualGroup(rows,index){
+  var first=rows[0]||{},lines=rows.slice();while(lines.length<3){lines.push({id:manualGroupKey(first)+":"+lines.length,reps:null,durationSeconds:null,weightKg:null});}
+  return '<div class="strength-manual-group" data-manual-group><div class="strength-manual-head"><div><b>Manual exercise '+(index+1)+'</b> <span>not linked to a Garmin set</span></div><button type="button" class="strength-remove" data-strength-remove>Remove</button></div><label class="strength-field">Exercise<input data-manual-exercise list="strength-exercise-options" value="'+esc(first.exercise)+'" placeholder="Choose or type exercise"></label><div class="strength-row-actions"><label class="strength-per-side"><input data-manual-per-side type="checkbox" '+(first.perSide?"checked":"")+'> Reps/time are per side</label><span class="strength-original">Enter reps or seconds. For carries, use total load consistently (2 × 24 kg = 48 kg).</span></div><div class="strength-manual-sets">'+lines.map(function(row,setIndex){return '<div class="strength-manual-pair" data-manual-line data-set-id="'+esc(row.id)+'"><div class="strength-manual-set-head"><b>Set '+(setIndex+1)+'</b>'+(setIndex?'<button type="button" class="strength-copy" data-manual-copy aria-label="Copy repetitions, duration and weight from previous set">↳ Copy previous</button>':'')+'</div><div class="strength-manual-values"><label class="strength-field">Reps<input data-manual-reps type="number" inputmode="numeric" min="0" step="1" value="'+esc(inputNumber(row.reps))+'"></label><label class="strength-field">Seconds<input data-manual-duration type="number" inputmode="decimal" min="0" max="86400" step="1" value="'+esc(inputNumber(row.durationSeconds))+'"></label><label class="strength-field">kg<input data-manual-weight type="number" inputmode="decimal" min="0" max="1000" step="0.5" value="'+esc(inputNumber(row.weightKg))+'"></label></div></div>';}).join("")+'</div></div>';
+}
+
+function renderStrengthEditor(){
+  var payload=STRENGTH_STATE.payload||{},sets=payload.sets||[],garmin=sets.filter(function(row){return row.source==="garmin";}),manual=sets.filter(function(row){return row.source==="manual";});
+  var recent=(payload.recentExercises||[]).concat(payload.exercises||[]),seen={},options=recent.filter(function(name){var key=String(name).toLowerCase();if(!name||seen[key])return false;seen[key]=true;return true;}).map(function(name){return '<option value="'+esc(name)+'"></option>';}).join("");
+  var grouped={},groupOrder=[];manual.forEach(function(row){var key=manualGroupKey(row);if(!grouped[key]){grouped[key]=[];groupOrder.push(key);}grouped[key].push(row);});
+  var content=document.getElementById("strength-editor-content");
+  content.innerHTML='<datalist id="strength-exercise-options">'+options+'</datalist>'+(payload.warning?'<div class="strength-banner warn">'+esc(payload.warning)+'</div>':'<div class="strength-banner">Garmin values stay recoverable. Saved corrections are used by this dashboard and its AI advice.</div>')+'<div class="strength-editor-title"><div><h3>Garmin sets</h3><p>Tap any value to correct it. Use reps, seconds, or both; weight is optional.</p></div><button type="button" class="strength-apply" data-strength-revert>Revert Garmin values</button></div><div class="strength-set-list">'+(garmin.length?garmin.map(strengthGarminRow).join(""):'<div class="strength-empty">Garmin did not return any recorded sets. You can still add the exercises manually below.</div>')+'</div><div class="strength-editor-title"><div><h3>Sets Garmin missed</h3><p>Adds three sets by default; copy the previous set when values repeat.</p></div><button type="button" class="strength-add" data-strength-add>+ Add exercise</button></div><div class="strength-manual-list">'+groupOrder.map(function(key,index){return strengthManualGroup(grouped[key],index);}).join("")+'</div><p class="strength-status" id="strength-status" aria-live="polite">'+(payload.savedAt?"Last saved "+new Date(payload.savedAt).toLocaleString():"Not saved yet")+'</p>';
+}
+
+function openStrengthEditor(activityId){
+  var activity=((CURRENT_DASHBOARD||{}).recent||[]).find(function(row){return String(row.activityId)===String(activityId);})||(((CURRENT_DASHBOARD||{}).workouts||{}).lastStrength)||{};
+  var modal=ensureStrengthModal();STRENGTH_STATE={activity:activity,payload:{sets:[]}};STRENGTH_DIRTY=false;modal.hidden=false;document.body.classList.add("modal-open");
+  document.getElementById("strength-dialog-title").textContent=activity.name||"Strength details";
+  document.getElementById("strength-dialog-meta").textContent=((activity.start||"").replace("T"," "))+(activity.min?" · "+activity.min+" min":"");
+  document.getElementById("strength-editor-content").innerHTML='<div class="state"><div><div class="spin"></div>Loading Garmin sets…</div></div>';
+  fetch("/api/strength-activities/"+encodeURIComponent(activityId),{headers:{Authorization:"Bearer "+TOKEN}})
+    .then(function(response){return response.json().then(function(body){if(!response.ok)throw new Error(body.error||"Could not load strength sets");return body;});})
+    .then(function(payload){STRENGTH_STATE.payload=payload;renderStrengthEditor();})
+    .catch(function(error){document.getElementById("strength-editor-content").innerHTML='<div class="strength-empty"><b>Could not load this activity.</b><br>'+esc(error.message)+'</div>';});
+}
+
+function collectStrengthSets(){
+  var originalById={};((STRENGTH_STATE.payload||{}).sets||[]).forEach(function(row){originalById[row.id]=row;});var sets=[];
+  document.querySelectorAll("#strength-modal [data-strength-row]").forEach(function(node){var source=originalById[node.dataset.setId]||{};sets.push({id:source.id,source:"garmin",garminIndex:source.garminIndex,setType:source.setType,startTime:source.startTime,durationSeconds:readStrengthNumber(node.querySelector('[data-strength-field="durationSeconds"]'),"Duration"),exercise:node.querySelector('[data-strength-field="exercise"]').value.trim()||null,reps:readStrengthNumber(node.querySelector('[data-strength-field="reps"]'),"Repetitions"),weightKg:readStrengthNumber(node.querySelector('[data-strength-field="weightKg"]'),"Weight"),perSide:node.querySelector('[data-strength-field="perSide"]').checked,rawExercise:source.rawExercise,rawReps:source.rawReps,rawDurationSeconds:source.rawDurationSeconds,rawWeightKg:source.rawWeightKg});});
+  document.querySelectorAll("#strength-modal [data-manual-group]").forEach(function(group){var exercise=group.querySelector("[data-manual-exercise]").value.trim(),perSide=group.querySelector("[data-manual-per-side]").checked;group.querySelectorAll("[data-manual-line]").forEach(function(line){var reps=readStrengthNumber(line.querySelector("[data-manual-reps]"),"Repetitions"),duration=readStrengthNumber(line.querySelector("[data-manual-duration]"),"Duration"),weight=readStrengthNumber(line.querySelector("[data-manual-weight]"),"Weight");if(reps==null&&duration==null&&weight==null)return;if(!exercise)throw new Error("Choose an exercise for every manual set");if(reps==null&&!duration)throw new Error("Enter repetitions or seconds for every manual set");sets.push({id:line.dataset.setId,source:"manual",setType:"ACTIVE",exercise:exercise,reps:reps,durationSeconds:duration,weightKg:weight,perSide:perSide});});});
+  return sets;
+}
+
+function copyPreviousManualSet(button){
+  var line=button.closest("[data-manual-line]"),previous=line&&line.previousElementSibling;if(!previous)return;
+  [["[data-manual-reps]","[data-manual-reps]"],["[data-manual-duration]","[data-manual-duration]"],["[data-manual-weight]","[data-manual-weight]"]].forEach(function(pair){var from=previous.querySelector(pair[0]),to=line.querySelector(pair[1]);to.value=from.value;to.classList.add("changed");});
+  STRENGTH_DIRTY=true;setStrengthStatus("Previous set values copied");
+}
+
+function applyExerciseToThree(setId){
+  var rows=Array.from(document.querySelectorAll("#strength-modal [data-strength-row]")),index=rows.findIndex(function(row){return row.dataset.setId===setId;});if(index<0)return;var exercise=rows[index].querySelector('[data-strength-field="exercise"]').value.trim(),perSide=rows[index].querySelector('[data-strength-field="perSide"]').checked;if(!exercise){setStrengthStatus("Choose or type an exercise first",true);return;}rows.slice(index,index+3).forEach(function(row){var input=row.querySelector('[data-strength-field="exercise"]'),check=row.querySelector('[data-strength-field="perSide"]');input.value=exercise;input.classList.add("changed");check.checked=perSide;var label=row.querySelector("[data-strength-reps-label]");if(label)label.textContent=perSide?"Reps/side":"Reps";});STRENGTH_DIRTY=true;setStrengthStatus(exercise+" assigned to "+Math.min(3,rows.length-index)+" sets");
+}
+
+function revertGarminStrengthRows(){
+  var originalById={};((STRENGTH_STATE.payload||{}).sets||[]).forEach(function(row){originalById[row.id]=row;});document.querySelectorAll("#strength-modal [data-strength-row]").forEach(function(node){var row=originalById[node.dataset.setId]||{};node.querySelector('[data-strength-field="exercise"]').value=row.rawExercise||"";node.querySelector('[data-strength-field="reps"]').value=inputNumber(row.rawReps);node.querySelector('[data-strength-field="durationSeconds"]').value=inputNumber(row.rawDurationSeconds);node.querySelector('[data-strength-field="weightKg"]').value=inputNumber(row.rawWeightKg);node.querySelector('[data-strength-field="perSide"]').checked=false;node.querySelectorAll(".changed").forEach(function(input){input.classList.remove("changed");});var label=node.querySelector("[data-strength-reps-label]");if(label)label.textContent="Reps";});STRENGTH_DIRTY=true;setStrengthStatus("Original Garmin values restored — save to confirm");
+}
+
+function addManualStrengthGroup(){
+  try{STRENGTH_STATE.payload.sets=collectStrengthSets();}catch(error){setStrengthStatus(error.message,true);return;}var key="manual:"+Date.now().toString(36);for(var index=0;index<3;index++)STRENGTH_STATE.payload.sets.push({id:key+":"+index,source:"manual",setType:"ACTIVE",exercise:null,reps:null,durationSeconds:null,weightKg:null,perSide:false});STRENGTH_DIRTY=true;renderStrengthEditor();setStrengthStatus("New three-set exercise added");var groups=document.querySelectorAll("#strength-modal [data-manual-group]");if(groups.length)groups[groups.length-1].scrollIntoView({behavior:"smooth",block:"nearest"});
+}
+
+function saveStrengthDetails(){
+  var button=document.getElementById("strength-save"),sets;try{sets=collectStrengthSets();}catch(error){setStrengthStatus(error.message,true);return;}button.disabled=true;button.textContent="Saving…";setStrengthStatus("Saving details…");var activity=STRENGTH_STATE.activity||{};
+  fetch("/api/strength-activities/"+encodeURIComponent(activity.activityId),{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({activityName:activity.name,activityStart:activity.start,sets:sets})})
+    .then(function(response){return response.json().then(function(body){if(!response.ok)throw new Error(body.error||"Could not save strength details");return body;});})
+    .then(function(payload){STRENGTH_STATE.payload=payload;STRENGTH_DIRTY=false;setStrengthStatus("Saved. Updating the dashboard and advice…");setTimeout(function(){var modal=document.getElementById("strength-modal");if(modal)modal.hidden=true;document.body.classList.remove("modal-open");load();},450);})
+    .catch(function(error){setStrengthStatus(error.message,true);})
+    .finally(function(){button.disabled=false;button.textContent="Save details";});
+}
 function chartTip(svg,points,format){
   if(!svg||!points||!points.length)return;var tip=document.getElementById("svg-tip");if(!tip){tip=el("div","svg-tip");tip.id="svg-tip";tip.hidden=true;document.body.appendChild(tip);}
   svg.onpointermove=function(e){var r=svg.getBoundingClientRect(),i=Math.max(0,Math.min(points.length-1,Math.round((e.clientX-r.left)/r.width*(points.length-1))));tip.innerHTML=format(points[i]);tip.style.left=e.clientX+"px";tip.style.top=e.clientY+"px";tip.hidden=false;};svg.onpointerleave=function(){tip.hidden=true;};
 }
+
+function muscleCreditList(items,role){
+  var selected=(items||[]).filter(function(item){return item.role===role;});
+  if(!selected.length)return '<span class="muscle-unmapped">—</span>';
+  return selected.map(function(item){return '<span class="muscle-credit">'+esc(item.label)+' · '+item.volumeCreditPct+'%</span>';}).join("");
+}
+function renderMuscleExerciseTable(week){
+  var target=document.getElementById("muscle-exercise-table");if(!target)return;var rows=week.exerciseBreakdown||[];
+  if(!rows.length){target.innerHTML='<div class="meta">No detailed strength sets were saved for this week.</div>';return;}
+  target.innerHTML='<div class="muscle-table-wrap"><table class="muscle-table"><thead><tr><th>Exercise</th><th>Sets</th><th>Direct credit</th><th>Assisting credit</th></tr></thead><tbody>'+rows.map(function(row){return '<tr><td>'+esc(row.exercise)+(row.mapped?'':' <span class="muscle-unmapped">· needs mapping</span>')+'</td><td>'+row.sets+'</td><td>'+muscleCreditList(row.muscles,"primary")+'</td><td>'+muscleCreditList(row.muscles,"assisting")+'</td></tr>';}).join("")+'</tbody></table></div><p class="metricnote">Percentages are chart volume credits, not measured muscle activation. Primary muscles receive 100% of a set; assisting muscles receive 50%.</p>';
+}
+function drawMuscleVolume(index){
+  var weeks=(MUSCLE_STATE||{}).weeks||[],svg=document.getElementById("muscle-volume-chart");if(!weeks.length||!svg)return;
+  MUSCLE_WEEK_INDEX=Math.max(0,Math.min(weeks.length-1,index));var week=weeks[MUSCLE_WEEK_INDEX],rows=week.muscles||[],source=week.sources||{};
+  document.getElementById("muscle-week-label").textContent=week.label+(week.isCurrent?" · current":"");
+  document.getElementById("muscle-prev").disabled=MUSCLE_WEEK_INDEX===0;document.getElementById("muscle-next").disabled=MUSCLE_WEEK_INDEX===weeks.length-1;
+  var movement=(source.steps?comma(source.steps)+" steps":"no step data")+(source.floors?" · "+comma(source.floors)+" floors":"");
+  document.getElementById("muscle-summary").textContent=source.strengthSets+" classified strength sets · "+source.cardioSessions+" cardio sessions / "+source.cardioMinutes+" min · "+movement+(source.unclassifiedSets?" · "+source.unclassifiedSets+" set(s) need mapping":"");
+  renderMuscleExerciseTable(week);svg.innerHTML="";var W=1000,H=330,pL=76,pR=12,pT=25,pB=66,plotW=W-pL-pR,plotH=H-pT-pB;
+  var top=Math.max.apply(null,rows.map(function(row){return row.total||0;}).concat([4]));top=Math.max(4,Math.ceil(top/2)*2);
+  function Y(value){return pT+(top-value)/top*plotH;}var ticks=4;
+  for(var tick=0;tick<=ticks;tick++){var value=top*tick/ticks,y=Y(value),line=document.createElementNS(ns,"line"),label=document.createElementNS(ns,"text");line.setAttribute("x1",pL);line.setAttribute("x2",W-pR);line.setAttribute("y1",y);line.setAttribute("y2",y);line.setAttribute("stroke",css("--border"));svg.appendChild(line);label.setAttribute("x",pL-9);label.setAttribute("y",y+5);label.setAttribute("text-anchor","end");label.setAttribute("fill",css("--faint"));label.setAttribute("font-size",15);label.textContent=Number(value.toFixed(1));svg.appendChild(label);}
+  var axisTitle=document.createElementNS(ns,"text");axisTitle.setAttribute("x",-(pT+plotH/2));axisTitle.setAttribute("y",17);axisTitle.setAttribute("transform","rotate(-90)");axisTitle.setAttribute("text-anchor","middle");axisTitle.setAttribute("fill",css("--faint"));axisTitle.setAttribute("font-size",14);axisTitle.setAttribute("font-weight",650);axisTitle.textContent="Stimulus units";svg.appendChild(axisTitle);
+  var slot=plotW/Math.max(1,rows.length),barWidth=slot*.58,shortNames={back:"Back",hamstrings:"Hams",triceps:"Tri",biceps:"Bi",calves:"Calves",delts:"Delts",quads:"Quads",glutes:"Glutes",chest:"Chest",core:"Core"};
+  rows.forEach(function(row,i){var x=pL+i*slot+(slot-barWidth)/2,totalY=Y(row.total||0),directY=Y(row.direct||0),total=document.createElementNS(ns,"rect"),direct=document.createElementNS(ns,"rect"),name=document.createElementNS(ns,"text");total.setAttribute("x",x);total.setAttribute("y",totalY);total.setAttribute("width",barWidth);total.setAttribute("height",Math.max(0,Y(0)-totalY));total.setAttribute("rx",4);total.setAttribute("fill","#22d3ee");svg.appendChild(total);direct.setAttribute("x",x);direct.setAttribute("y",directY);direct.setAttribute("width",barWidth);direct.setAttribute("height",Math.max(0,Y(0)-directY));direct.setAttribute("rx",4);direct.setAttribute("fill","#0f8f8a");svg.appendChild(direct);name.setAttribute("x",x+barWidth/2);name.setAttribute("y",H-35);name.setAttribute("text-anchor","middle");name.setAttribute("fill",css("--text"));name.setAttribute("font-size",15);name.setAttribute("font-weight",650);name.textContent=shortNames[row.key]||row.label;svg.appendChild(name);if(row.total>0){var totalLabel=document.createElementNS(ns,"text");totalLabel.setAttribute("x",x+barWidth/2);totalLabel.setAttribute("y",totalY-7);totalLabel.setAttribute("text-anchor","middle");totalLabel.setAttribute("fill",css("--text"));totalLabel.setAttribute("font-size",14);totalLabel.setAttribute("font-weight",700);totalLabel.textContent=row.total;svg.appendChild(totalLabel);}});
+  chartTip(svg,rows,function(row){return '<b>'+esc(row.label)+'</b><br>Direct sets: '+row.direct+'<br>Assisting strength: '+row.indirectStrength+'<br>Cardio: '+row.cardio+'<br>Steps / floors: '+row.movement+'<br><b>Total: '+row.total+'</b>';});
+}
+function changeMuscleWeek(delta){drawMuscleVolume(MUSCLE_WEEK_INDEX+delta);}
 
 function load(){
   var app=document.getElementById("app");
@@ -1042,8 +2063,8 @@ function WORKOUTS(d){
   var s=d.workouts||{},c=el("div","card sport walk");
   var head='<div class="top"><span class="ico">🏋️</span><div><h3>Workouts</h3><div class="d">HIIT · rowing · SkiErg · elliptical</div></div></div>';
   if(!s.hasData){c.innerHTML=head+'<div class="empty"><span class="pill mute">Ready</span><span class="msg">Log a gym, cardio or indoor-machine activity in Garmin and it will appear here.</span></div>';return c;}
-  var wk=s.week||{},last=s.last||{},types=(s.types||[]).map(function(x){return x.name+' · '+x.count;}).join(' · ');
-  c.innerHTML=head+'<div class="tstat"><div class="t"><div class="n">'+n(wk.sessions)+'</div><div class="l">sessions · 7d</div></div><div class="t"><div class="n">'+n(wk.min)+'</div><div class="l">minutes · 7d</div></div><div class="t"><div class="n">'+comma(wk.cal)+'</div><div class="l">kcal · 7d</div></div></div><div class="last">Last: <b>'+n(last.name)+'</b> · '+n(last.min)+' min'+(last.hr?' · '+last.hr+' bpm':'')+'<br><span style="color:var(--faint)">'+types+'</span></div>';
+  var wk=s.week||{},last=s.last||{},strength=s.lastStrength||{},types=(s.types||[]).map(function(x){return x.name+' · '+x.count;}).join(' · '),action=strength.activityId?'<button type="button" class="rf strength-card-action" data-strength-id="'+esc(strength.activityId)+'">Edit latest strength details</button>':'';
+  c.innerHTML=head+'<div class="tstat"><div class="t"><div class="n">'+n(wk.sessions)+'</div><div class="l">sessions · 7d</div></div><div class="t"><div class="n">'+n(wk.min)+'</div><div class="l">minutes · 7d</div></div><div class="t"><div class="n">'+comma(wk.cal)+'</div><div class="l">kcal · 7d</div></div></div><div class="last">Last: <b>'+n(last.name)+'</b> · '+n(last.min)+' min'+(last.hr?' · '+last.hr+' bpm':'')+'<br><span style="color:var(--faint)">'+types+'</span></div>'+action;
   return c;
 }
 
@@ -1092,17 +2113,18 @@ function loadPersonalRecommendation(d,refresh){
   var button=document.getElementById("refresh-recommendation");
   if(!target)return;
   if(refresh){target.textContent="Updating your recommendation…";if(button){button.disabled=true;button.textContent="Updating…";}}
-  var snapshot={date:d.date,wellness:d.wellness,body:d.body,injuries:d.injuries,recent:d.recent,relativeEffort:d.relativeEffort};
+  var snapshot={date:d.date,wellness:d.wellness,body:d.body,injuries:d.injuries,recent:d.recent,sports:d.sports,relativeEffort:d.relativeEffort,strength:d.strength,muscleVolume:d.muscleVolume,fitnessSeries:d.fitnessSeries,trainingLoadTrend:d.trainingLoadTrend,sleepSeries:d.sleepSeries,hrvSeries:d.hrvSeries,hrZonesWeek:d.hrZonesWeek};
   fetch("/api/recommendation",{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({dashboard:snapshot,refresh:!!refresh})})
     .then(function(r){return r.json().then(function(body){if(!r.ok)throw new Error(body.error||"Could not get a recommendation");return body;});})
     .then(function(result){target.textContent=result.text;target.parentElement.classList.add("ai-ready");})
-    .catch(function(){if(refresh)target.textContent="Could not update the recommendation. Please try again.";})
+    .catch(function(error){if(refresh)target.textContent="Could not update the recommendation: "+error.message;})
     .finally(function(){if(button){button.disabled=false;button.textContent="Refresh advice";}});
 }
 
 function render(d){
   var app=document.getElementById("app");
   app.innerHTML="";
+  CURRENT_DASHBOARD=d;
   var w=d.wellness||{};
   var bb=w.bodyBattery||{},steps=w.steps||{},rhr=w.restingHr||{},stress=w.stress||{};
 
@@ -1192,6 +2214,11 @@ function render(d){
   tri.appendChild(SPORT({key:"run",name:"Run",emoji:"🏃",tag:"road + track"},d));
   app.appendChild(tri);
 
+  var mv=d.muscleVolume||{},muscleCard=el("div","card muscle-card");MUSCLE_STATE=mv;
+  muscleCard.innerHTML='<div class="muscle-card-head"><div><h3>Muscle stimulus · weekly</h3><p>Direct lifting sets plus conservative supporting exposure</p></div><div class="muscle-week-nav"><button type="button" id="muscle-prev" aria-label="Previous week">‹</button><span class="muscle-week-label" id="muscle-week-label">Current week</span><button type="button" id="muscle-next" aria-label="Next week">›</button></div></div><p class="muscle-summary" id="muscle-summary"></p><div class="muscle-chart-wrap" role="region" aria-label="Scrollable weekly muscle chart" tabindex="0"><svg class="musclechart" id="muscle-volume-chart" viewBox="0 0 1000 330" preserveAspectRatio="none" aria-label="Weekly direct and indirect muscle volume chart"></svg></div><p class="muscle-scroll-hint">Swipe chart and table to see more →</p><div class="muscle-legend"><span><i style="background:#0f8f8a"></i>Direct strength sets</span><span><i style="background:#22d3ee"></i>Total including assisting, cardio and movement</span></div><p class="metricnote">'+esc(mv.formula||"")+'</p><details class="muscle-map" open><summary>Exercise allocation for this week</summary><div id="muscle-exercise-table"></div></details>';
+  app.appendChild(muscleCard);
+  if((mv.weeks||[]).length){document.getElementById("muscle-prev").addEventListener("click",function(){changeMuscleWeek(-1);});document.getElementById("muscle-next").addEventListener("click",function(){changeMuscleWeek(1);});drawMuscleVolume(mv.currentIndex==null?mv.weeks.length-1:mv.currentIndex);}else{document.getElementById("muscle-summary").textContent="No muscle-volume data is available yet.";document.getElementById("muscle-prev").disabled=true;document.getElementById("muscle-next").disabled=true;}
+
   // Strava-inspired effort + fitness views. These deliberately remain separate
   // from Garmin's Training Load because the two products use different models.
   app.appendChild(sec("Training response"));
@@ -1261,7 +2288,7 @@ function render(d){
     var col={swim:"var(--swim)",bike:"var(--bike)",run:"var(--run)",walk:"var(--accent)"}[a.sport]||"var(--accent)";
     var r=el("div","act");
     r.innerHTML='<div class="nm"><span class="ic" style="background:color-mix(in srgb,'+col+' 18%,transparent)">'+ic+'</span>'+
-      '<span class="t">'+a.name+'<small>'+(a.start||"").replace("T"," ")+(a.location?" · "+a.location:"")+'</small></span></div>'+
+      '<span class="t">'+a.name+'<small>'+(a.start||"").replace("T"," ")+(a.location?" · "+a.location:"")+'</small>'+(a.isStrength&&a.activityId?'<button type="button" class="strength-open" data-strength-id="'+esc(a.activityId)+'">Edit exercise sets</button>':'')+'</span></div>'+
       '<div class="c" data-k="Dist"><b>'+n(a.km)+'</b> km</div>'+
       '<div class="c" data-k="Time"><b>'+n(a.min)+'</b> min</div>'+
       '<div class="c hidesm" data-k="HR"><b>'+n(a.hr)+'</b> bpm</div>'+
@@ -1288,6 +2315,7 @@ function render(d){
   document.getElementById("rf").addEventListener("click",load);
   document.getElementById("body-entry-toggle").addEventListener("click",function(){toggleEntry("body-entry");});
   document.getElementById("injury-entry-toggle").addEventListener("click",function(){toggleEntry("injury-entry");});
+  document.querySelectorAll("[data-strength-id]").forEach(function(button){button.addEventListener("click",function(){openStrengthEditor(button.dataset.strengthId);});});
   document.getElementById("body-entry").addEventListener("submit",function(event){event.preventDefault();var data={timestamp:new Date().toISOString()};new FormData(event.target).forEach(function(value,key){data[key]=value;});var status=document.getElementById("body-entry-status");status.textContent="Saving…";fetch("/api/body-measurements",{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify(data)}).then(function(r){return r.json().then(function(body){if(!r.ok)throw new Error(body.error||"Could not save measurement");return body;});}).then(function(){status.textContent="Saved. Refreshing dashboard…";load();}).catch(function(error){status.textContent=error.message;});});
   document.getElementById("injury-entry").addEventListener("submit",function(event){event.preventDefault();saveEntry("/api/injury-measurements","injury-entry","injury-entry-status");});
 }
