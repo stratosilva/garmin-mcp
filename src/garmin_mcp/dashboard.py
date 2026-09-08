@@ -196,6 +196,11 @@ def _recommendation_snapshot(dashboard):
             "hrv_history_7d": (dashboard.get("hrvSeries") or [])[-7:],
             "resting_heart_rate": wellness.get("restingHr"),
             "stress": wellness.get("stress"),
+            "sleep_debt": ((dashboard.get("recovery") or {}).get("debt") or {}).get("minutes"),
+            "sleep_debt_level": ((dashboard.get("recovery") or {}).get("debt") or {}).get("level"),
+            "sleep_need_hours": (dashboard.get("recovery") or {}).get("sleepNeedHours"),
+            "sleep_regularity": (dashboard.get("recovery") or {}).get("regularity"),
+            "readiness_contributors": (dashboard.get("recovery") or {}).get("contributors"),
         },
         "energy_and_body": {
             "activity_calories": wellness.get("calories"),
@@ -1167,23 +1172,294 @@ def _find_num(data, keys):
     return None
 
 
-def _sleep_values(payload):
-    daily = ((payload or {}).get("dailySleepDTO") or {}) if isinstance(payload, dict) else {}
-    seconds = _num(daily.get("sleepTimeSeconds"))
-    score = _num(((daily.get("sleepScores") or {}).get("overall") or {}).get("value"))
+# ---- sleep & recovery -------------------------------------------------------
+# Garmin supplies the raw nightly material; the baselines, sleep debt,
+# regularity and contributor grading below are derived here, in the spirit of
+# Oura's readiness/sleep breakdown. Body temperature has no equivalent in the
+# Garmin Connect endpoints, so that contributor is deliberately absent.
+
+SLEEP_HISTORY_DAYS = 60          # window for baselines and personalised need
+SLEEP_DEBT_DAYS = 14             # rolling window the debt accumulates over
+SLEEP_DEBT_DECAY = 0.9           # older nights in that window count for less
+SLEEP_NEED_HISTORY_WEIGHT = 0.5  # blend of achieved sleep vs the age guideline
+SLEEP_NEED_MIN_HOURS = 6.5
+SLEEP_NEED_MAX_HOURS = 9.0
+# Sleep debt bands, in minutes, matching Oura's none/low/moderate/high wording.
+SLEEP_DEBT_BANDS = ((30, "none"), (120, "low"), (300, "moderate"))
+
+
+def _recommended_sleep_hours(age):
+    """Midpoint of the National Sleep Foundation band for the athlete's age."""
+    if age is None:
+        return 8.0
+    if age < 18:
+        return 9.0
+    if age < 65:  # adults 18-64: 7-9 hours
+        return 8.0
+    return 7.5    # 65+: 7-8 hours
+
+
+def _local_clock(millis):
+    """Convert a Garmin local-timestamp (epoch ms) to hours past midnight."""
+    value = _num(millis)
+    if not value:
+        return None
+    # Garmin's *Local timestamps are already shifted, so reading them as UTC
+    # recovers the wall-clock time the athlete actually went to bed.
+    stamp = datetime.datetime.fromtimestamp(value / 1000.0, datetime.timezone.utc)
+    return stamp.hour + stamp.minute / 60.0
+
+
+def _sleep_night(row):
+    """Normalise one night from either Garmin sleep payload shape.
+
+    ``get_sleep_data`` nests everything under ``dailySleepDTO``; the range
+    endpoint ``get_sleep_daily`` returns flatter per-day rows. Field spellings
+    differ between device generations, so every lookup goes through the
+    tolerant recursive helper rather than a fixed path.
+    """
+    if not isinstance(row, dict):
+        return None
+    daily = row.get("dailySleepDTO") if isinstance(row.get("dailySleepDTO"), dict) else row
+    date = daily.get("calendarDate") or row.get("calendarDate")
+    seconds = _find_num(daily, ("sleepTimeSeconds", "totalSleepSeconds", "sleepSeconds"))
+    if not date or not seconds:
+        return None
+    stages = {
+        "deep": _find_num(daily, ("deepSleepSeconds",)) or 0,
+        "light": _find_num(daily, ("lightSleepSeconds",)) or 0,
+        "rem": _find_num(daily, ("remSleepSeconds", "remSleepInSeconds")) or 0,
+        "awake": _find_num(daily, ("awakeSleepSeconds", "awakeSeconds")) or 0,
+    }
+    start_ms = _find_num(daily, ("sleepStartTimestampLocal", "sleepStartTimestampGMT"))
+    end_ms = _find_num(daily, ("sleepEndTimestampLocal", "sleepEndTimestampGMT"))
+    in_bed = (end_ms - start_ms) / 1000.0 if start_ms and end_ms and end_ms > start_ms else None
+    # Garmin reports awake time inside the window, so efficiency is asleep/in-bed.
+    efficiency = round(seconds / in_bed * 100) if in_bed and in_bed > 0 else None
+    scores = daily.get("sleepScores") if isinstance(daily.get("sleepScores"), dict) else {}
     return {
-        "hours": round(seconds / 3600.0, 1) if seconds else None,
-        "score": score,
+        "date": str(date)[:10],
+        "hours": round(seconds / 3600.0, 1),
+        "seconds": seconds,
+        "score": _find_num(scores.get("overall") or {}, ("value",)) or _find_num(daily, ("sleepScoreTotal",)),
+        "stages": {name: round(value / 60.0) for name, value in stages.items()},
+        "inBedHours": round(in_bed / 3600.0, 1) if in_bed else None,
+        "efficiency": efficiency if efficiency is None or efficiency <= 100 else 100,
+        "latency": round((_find_num(daily, ("sleepLatencySeconds", "latencySeconds")) or 0) / 60.0) or None,
+        "restlessMoments": _find_num(daily, ("restlessMomentsCount",)),
+        "awakeCount": _find_num(daily, ("awakeCount",)),
+        "avgHr": _find_num(daily, ("restingHeartRate", "averageHeartRate")),
+        "avgSpo2": _find_num(daily, ("averageSpO2Value", "averageSpo2Value")),
+        "avgRespiration": _find_num(daily, ("averageRespirationValue",)),
+        "bedTime": _local_clock(start_ms),
+        "wakeTime": _local_clock(end_ms),
     }
 
 
 def _hrv_values(payload):
-    summary = ((payload or {}).get("hrvSummary") or {}) if isinstance(payload, dict) else {}
+    """Last night's HRV plus Garmin's own balanced baseline range.
+
+    Garmin nests the baseline under ``baseline`` with names that have changed
+    across firmware (``balancedLow``/``balancedUpper``, older ``lowUpper``), so
+    the previous flat ``baselineLow``/``baselineHigh`` lookup always missed.
+    """
+    if not isinstance(payload, dict):
+        return {"value": None, "status": None, "baselineLow": None, "baselineHigh": None}
+    summary = payload.get("hrvSummary") if isinstance(payload.get("hrvSummary"), dict) else payload
+    baseline = summary.get("baseline") if isinstance(summary.get("baseline"), dict) else summary
     return {
-        "value": _num(summary.get("lastNightAvg")),
+        "value": _find_num(summary, ("lastNightAvg", "lastNightAverage")),
         "status": summary.get("status"),
-        "baselineLow": _num(summary.get("baselineLow")),
-        "baselineHigh": _num(summary.get("baselineHigh")),
+        "weeklyAvg": _find_num(summary, ("weeklyAvg", "weeklyAverage")),
+        "baselineLow": _find_num(baseline, ("balancedLow", "baselineLow", "lowUpper")),
+        "baselineHigh": _find_num(baseline, ("balancedUpper", "baselineHigh", "balancedUpperLimit")),
+    }
+
+
+def _percentile(values, fraction):
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    position = max(0, min(len(ordered) - 1, int(round(fraction * (len(ordered) - 1)))))
+    return ordered[position]
+
+
+def _sleep_need_hours(nights, age):
+    """Blend what the athlete actually achieves with the age guideline.
+
+    Using history alone would ratify chronic under-sleeping; using the
+    guideline alone ignores that sleep need genuinely varies between people.
+    The achieved figure is the 80th percentile of recorded nights — close to an
+    unconstrained night rather than an average dragged down by early alarms.
+    """
+    guideline = _recommended_sleep_hours(age)
+    achieved = _percentile([night["hours"] for night in nights if night.get("hours")], 0.8)
+    if achieved is None:
+        return round(guideline, 2), guideline, None
+    need = (SLEEP_NEED_HISTORY_WEIGHT * achieved
+            + (1 - SLEEP_NEED_HISTORY_WEIGHT) * guideline)
+    need = max(SLEEP_NEED_MIN_HOURS, min(SLEEP_NEED_MAX_HOURS, need))
+    return round(need, 2), guideline, round(achieved, 2)
+
+
+def _sleep_debt(nights, need_hours, today):
+    """Rolling shortfall against sleep need, with surplus nights offsetting.
+
+    Nights with no recording are skipped rather than counted as zero sleep: a
+    night without the watch would otherwise inject a full night of phantom
+    debt. Recent nights are weighted more heavily, so the number responds to
+    the last few days rather than dragging a fortnight-old deficit forever.
+    """
+    by_date = {night["date"]: night for night in nights}
+    series, running = [], 0.0
+    for offset in range(SLEEP_DEBT_DAYS - 1, -1, -1):
+        day = today - datetime.timedelta(days=offset)
+        total = 0.0
+        for age_days in range(SLEEP_DEBT_DAYS):
+            night = by_date.get((day - datetime.timedelta(days=age_days)).isoformat())
+            if not night or not night.get("hours"):
+                continue
+            total += (need_hours - night["hours"]) * 60.0 * (SLEEP_DEBT_DECAY ** age_days)
+        running = max(0.0, total)
+        series.append({"date": day.isoformat(), "label": day.strftime("%a"),
+                       "minutes": round(running)})
+    level = "high"
+    for limit, name in SLEEP_DEBT_BANDS:
+        if running < limit:
+            level = name
+            break
+    return {"minutes": round(running), "level": level, "series": series,
+            "bands": [limit for limit, _ in SLEEP_DEBT_BANDS]}
+
+
+def _sleep_regularity(nights):
+    """Consistency of mid-sleep time, the strongest circadian signal we have."""
+    points = []
+    for night in nights[-SLEEP_DEBT_DAYS:]:
+        bed, wake = night.get("bedTime"), night.get("wakeTime")
+        if bed is None or wake is None:
+            continue
+        # Shift the evening half of the clock negative so a 23:30 bedtime and a
+        # 00:30 one are an hour apart rather than twenty-three.
+        bed_adjusted = bed - 24 if bed > 12 else bed
+        points.append((bed_adjusted + (bed_adjusted + night["hours"])) / 2.0)
+    if len(points) < 3:
+        return None
+    mean = sum(points) / len(points)
+    deviation = (sum((value - mean) ** 2 for value in points) / len(points)) ** 0.5
+    # An hour of typical drift costs roughly 25 points.
+    return {"score": max(0, min(100, round(100 - deviation * 25))),
+            "deviationMinutes": round(deviation * 60)}
+
+
+def _grade(value, optimal, good):
+    """Oura-style three-step qualifier for a contributor bar."""
+    if value is None:
+        return None
+    if value >= optimal:
+        return "optimal"
+    return "good" if value >= good else "attention"
+
+
+def _titlecase(value):
+    text = str(value or "").replace("_", " ").strip()
+    return text[:1].upper() + text[1:].lower() if text else None
+
+
+def _recovery_metrics(sleep_series, hrv_series, rhr_series, wellness, effort, age, today):
+    """Assemble the readiness contributors and the derived sleep figures."""
+    need_hours, guideline_hours, achieved_hours = _sleep_need_hours(sleep_series, age)
+    debt = _sleep_debt(sleep_series, need_hours, today)
+    regularity = _sleep_regularity(sleep_series)
+    last_night = wellness.get("sleep") or {}
+    hrv_today = wellness.get("hrv") or {}
+    recent_nights = sleep_series[-SLEEP_DEBT_DAYS:]
+    balance_hours = sum(night["hours"] for night in recent_nights)
+    balance_pct = (round(balance_hours / (need_hours * len(recent_nights)) * 100)
+                   if recent_nights else None)
+
+    rhr_values = [row["value"] for row in rhr_series]
+    rhr_baseline = round(sum(rhr_values) / len(rhr_values)) if rhr_values else None
+    rhr_today = rhr_values[-1] if rhr_values else (wellness.get("restingHr") or {}).get("value")
+    # Below baseline is the good direction for resting heart rate, so this grade
+    # is inverted relative to the others: each beat above baseline costs 8.
+    rhr_pct = (max(0, min(100, round(100 - (rhr_today - rhr_baseline) * 8)))
+               if rhr_today is not None and rhr_baseline else None)
+
+    # Garmin derives HRV status from the seven-day average against the personal
+    # baseline, so the contributor reports that figure rather than a single
+    # night, which can sit outside the band without the status changing.
+    hrv_week = hrv_today.get("weeklyAvg")
+    if hrv_week is None:
+        recent = [row["value"] for row in hrv_series[-7:] if row.get("value") is not None]
+        hrv_week = round(sum(recent) / len(recent)) if recent else hrv_today.get("value")
+    hrv_pct = {"balanced": 92, "unbalanced": 55,
+               "low": 35, "poor": 30}.get((hrv_today.get("status") or "").lower())
+
+    yesterday_effort = next((day.get("effort") for day in reversed(effort.get("days") or [])
+                             if day.get("effort") is not None), None)
+    capacity = effort.get("baseline")
+    previous_day_pct = None
+    if yesterday_effort is not None and capacity:
+        # A day near a seventh of weekly capacity is unremarkable; well above it
+        # is the "pay attention" case Oura flags after a hard session.
+        typical = capacity / 7.0
+        previous_day_pct = round(max(0.0, min(1.0, 1 - (yesterday_effort / typical - 1) / 3.0)) * 100)
+    activity_pct = {"within": 92, "below": 65, "above": 55}.get(effort.get("state"))
+
+    contributors = [
+        {"key": "restingHr", "label": "Resting heart rate", "percent": rhr_pct,
+         "detail": f"{rhr_today} bpm" if rhr_today else None,
+         "note": f"baseline {rhr_baseline} bpm" if rhr_baseline else None},
+        {"key": "hrvBalance", "label": "HRV balance", "percent": hrv_pct,
+         "detail": _titlecase(hrv_today.get("status")),
+         "note": f"{hrv_week} ms 7-day average" if hrv_week else None},
+        {"key": "sleep", "label": "Sleep", "percent": last_night.get("score"),
+         "detail": f"{last_night.get('hours')} h" if last_night.get("hours") else None,
+         "note": f"sleep score {last_night.get('score')}" if last_night.get("score") else None},
+        {"key": "sleepBalance", "label": "Sleep balance", "percent": balance_pct,
+         "detail": f"{round(balance_hours)} h over {len(recent_nights)} nights" if recent_nights else None,
+         "note": f"need {need_hours} h a night"},
+        {"key": "sleepRegularity", "label": "Sleep regularity",
+         "percent": (regularity or {}).get("score"),
+         "detail": f"±{regularity['deviationMinutes']} min" if regularity else None,
+         "note": "drift in mid-sleep time"},
+        {"key": "previousDay", "label": "Previous day activity", "percent": previous_day_pct,
+         "detail": f"{yesterday_effort} effort points" if yesterday_effort is not None else None,
+         "note": "yesterday against a typical day"},
+        {"key": "activityBalance", "label": "Activity balance", "percent": activity_pct,
+         "detail": {"within": "In range", "below": "Under range",
+                    "above": "Over range"}.get(effort.get("state")),
+         "note": "this week against your effort band"},
+    ]
+    for item in contributors:
+        item["grade"] = _grade(item["percent"], 85, 70)
+
+    return {
+        "contributors": [item for item in contributors if item["percent"] is not None],
+        "sleepNeedHours": need_hours,
+        "sleepGuidelineHours": guideline_hours,
+        "sleepAchievedHours": achieved_hours,
+        "age": age,
+        "debt": debt,
+        "regularity": regularity,
+        "rhrBaseline": rhr_baseline,
+        "lastNight": last_night or None,
+        "nights": recent_nights,
+        "needModel": (
+            f"Sleep need blends the {guideline_hours} h guideline for your age with the "
+            f"{achieved_hours} h you reach on an unhurried night (80th percentile of "
+            f"{len(sleep_series)} recorded nights), giving {need_hours} h."
+            if achieved_hours else
+            f"Sleep need defaults to the {guideline_hours} h guideline for your age "
+            "until more nights are recorded."
+        ),
+        "debtModel": (
+            f"Debt is the shortfall against that need across {SLEEP_DEBT_DAYS} nights, with "
+            "surplus nights cancelling deficits and recent nights weighted more heavily. "
+            "Nights without the watch are skipped, not counted as sleepless."
+        ),
+        "missing": "Body temperature is absent: Garmin Connect exposes no skin-temperature deviation.",
     }
 
 
@@ -1456,23 +1732,62 @@ def gather(client):
     # Daily stats provide reliable steps/calories averages. Garmin's dedicated
     # intensity endpoint provides the *current-week* moderated/vigorous total.
     daily_stats = []
-    sleep_series, hrv_series = [], []
     for i in range(6, -1, -1):
         day = today - datetime.timedelta(days=i)
         day_s = day.isoformat()
         day_stats = stats if day_s == stats_date else _call(client.get_stats, day_s)
         if isinstance(day_stats, dict):
             daily_stats.append(day_stats)
-        sleep_values = _sleep_values(_call(client.get_sleep_data, day_s))
-        if sleep_values["score"] is not None or sleep_values["hours"] is not None:
-            sleep_values["label"] = day.strftime("%a")
-            sleep_values["date"] = day_s
-            sleep_series.append(sleep_values)
-        hrv_values = _hrv_values(_call(client.get_hrv_data, day_s))
-        if hrv_values["value"] is not None or hrv_values["status"]:
-            hrv_values["label"] = day.strftime("%a")
-            hrv_values["date"] = day_s
-            hrv_series.append(hrv_values)
+
+    # ---- sleep, HRV and resting-HR history ----
+    # Range endpoints replace what used to be two calls per day: sixty nights
+    # now cost three requests instead of a hundred and twenty, which is what
+    # makes the baseline-relative metrics below affordable.
+    history_start = (today - datetime.timedelta(days=SLEEP_HISTORY_DAYS - 1)).isoformat()
+    sleep_rows = _call(client.get_sleep_daily, history_start, ds) or []
+    sleep_series = [night for night in (_sleep_night(row) for row in sleep_rows) if night]
+    if not sleep_series:  # older accounts without the stats endpoint
+        for i in range(SLEEP_DEBT_DAYS - 1, -1, -1):
+            day = today - datetime.timedelta(days=i)
+            night = _sleep_night(_call(client.get_sleep_data, day.isoformat()))
+            if night:
+                sleep_series.append(night)
+    sleep_series.sort(key=lambda night: night["date"])
+    for night in sleep_series:
+        night["label"] = datetime.date.fromisoformat(night["date"]).strftime("%a")
+
+    # Last night's full payload carries detail the daily summaries omit.
+    detailed = _sleep_night(_call(client.get_sleep_data, ds))
+    if detailed and sleep_series and sleep_series[-1]["date"] == detailed["date"]:
+        detailed["label"] = sleep_series[-1]["label"]
+        sleep_series[-1] = detailed
+
+    hrv_range = _call(client.get_hrv_data_range, history_start, ds)
+    hrv_rows = (hrv_range or {}).get("hrvSummaries") or (hrv_range if isinstance(hrv_range, list) else [])
+    hrv_series = []
+    for row in hrv_rows:
+        values = _hrv_values(row)
+        date = (row or {}).get("calendarDate") if isinstance(row, dict) else None
+        if date and (values["value"] is not None or values["status"]):
+            values["date"] = str(date)[:10]
+            values["label"] = datetime.date.fromisoformat(values["date"]).strftime("%a")
+            hrv_series.append(values)
+    if not hrv_series:  # range endpoint unavailable: fall back to recent days
+        for i in range(SLEEP_DEBT_DAYS - 1, -1, -1):
+            day = today - datetime.timedelta(days=i)
+            values = _hrv_values(_call(client.get_hrv_data, day.isoformat()))
+            if values["value"] is not None or values["status"]:
+                values.update({"date": day.isoformat(), "label": day.strftime("%a")})
+                hrv_series.append(values)
+    hrv_series.sort(key=lambda row: row["date"])
+
+    rhr_series = []
+    for row in _call(client.get_rhr_daily, history_start, ds) or []:
+        value = _find_num(row, ("value", "restingHeartRate")) if isinstance(row, dict) else None
+        date = row.get("calendarDate") if isinstance(row, dict) else None
+        if value and date:
+            rhr_series.append({"date": str(date)[:10], "value": round(value)})
+    rhr_series.sort(key=lambda row: row["date"])
 
     def average(field):
         values = [_num(day.get(field)) for day in daily_stats]
@@ -1497,12 +1812,14 @@ def gather(client):
 
     out["sleepSeries"] = sleep_series
     out["hrvSeries"] = hrv_series
+    out["rhrSeries"] = rhr_series
     w["sleep"] = sleep_series[-1] if sleep_series else None
     w["hrv"] = hrv_series[-1] if hrv_series else None
 
     rd = _call(client.get_training_readiness, ds)
     rd0 = rd[0] if isinstance(rd, list) and rd else (rd if isinstance(rd, dict) else None)
     w["readiness"] = {"score": _num((rd0 or {}).get("score")), "level": (rd0 or {}).get("level")} if rd0 and (rd0 or {}).get("score") is not None else None
+
 
     # A conservative coaching cue. It is intentionally not medical advice.
     hrv_status = ((w["hrv"] or {}).get("status") or "").lower()
@@ -1676,6 +1993,11 @@ def gather(client):
         "formula": "Each activity scores aerobic minutes by HR zone (below Z1 0.12 · Z1 0.2 · Z2 0.4 · Z3 0.8 · Z4 1.4 · Z5 2.2 points/min) plus Garmin Training Load ÷ 8 for interval intensity — no sport multipliers, so the points are comparable with Strava Relative Effort. Garmin Load ÷ 3 when no heart rate was recorded.",
         "rangeModel": "The shaded band is the suggested weekly range. Its floor is 80% of adaptive capacity, which climbs over ~6 weeks after weeks inside or above the band but eases back over ~3 when you train under it, so the band follows a quieter block instead of trailing months behind it. The ceiling is 130% of capacity, stretched further when recent weeks were erratic (capacity + 1.3× the recency-weighted deviation of the last six weeks, capped at 2.5× capacity) — a big week widens the top sharply, then relaxes week by week. The current week is judged against the band prorated by days elapsed.",
     }
+
+    # Readiness contributors depend on the effort band above, so they are built
+    # once it exists rather than alongside the raw sleep history.
+    out["recovery"] = _recovery_metrics(sleep_series, hrv_series, rhr_series, w,
+                                        out["relativeEffort"], age, today)
 
     # ---- HR zones this week (minutes per zone) ----
     zsum = [0.0, 0.0, 0.0, 0.0, 0.0]
@@ -1923,9 +2245,17 @@ button.rf svg{width:15px;height:15px}
 .zleg .z{display:flex;align-items:center;gap:6px}.zleg .sw{width:10px;height:10px;border-radius:3px;flex:none}
 .zleg b{color:var(--text);font-weight:650}
 .hydro .bar{margin-top:10px}
-.trendchart{width:100%;height:112px;display:block;margin-top:7px}.trendaxis{display:flex;justify-content:space-between;color:var(--faint);font-size:10.5px;margin-top:2px}
 .loadchart,.effortdaily{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}.loadchart{width:100%;height:190px;display:block;margin-top:8px}.loadchart text,.effortdaily text{font-family:inherit!important;font-size:19px!important;font-weight:600;letter-spacing:.01em}.primarychart{height:300px;margin-top:12px}.keycharts{display:grid;grid-template-columns:1fr;gap:16px}.rangeband{fill:color-mix(in srgb,var(--accent) 18%,transparent)}.charttabs{display:flex;gap:6px;flex-wrap:wrap}.charttabs button{border:1px solid var(--border);background:var(--surface-2);color:var(--muted);border-radius:999px;padding:5px 9px;font-size:11px;font-weight:700;cursor:pointer}.charttabs button.active{background:var(--accent);border-color:var(--accent);color:#fff}.metricnote{font-size:12px;color:var(--muted);margin-top:8px}
 .effortdetail{margin-top:14px;padding-top:13px;border-top:1px solid var(--border)}.effortdaily{width:100%;height:120px;display:block;margin-top:4px;cursor:crosshair}.effortlist{display:grid;gap:7px;margin-top:12px}.effortrow{display:flex;justify-content:space-between;gap:14px;padding:9px 11px;border-radius:10px;background:var(--surface-2);font-size:12.5px;color:var(--muted)}.effortrow b{color:var(--text)}.effortrow small{color:var(--faint);font-size:11.5px}.effortrow .score{white-space:nowrap;color:var(--accent);font-weight:750}.effortrow .score.hi{color:var(--warn)}.effortrow .score.max{color:var(--low)}.fitsummary{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-top:12px}.fitsummary .change{font-size:28px;font-weight:800}.fitsummary .up{color:var(--good)}.fitsummary .period{width:100%;color:var(--muted);font-size:12.5px}
+.contrib{margin-top:13px}.contrib:first-of-type{margin-top:10px}
+.contrib-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:5px}
+.contrib-head .k{font-size:13px;font-weight:650}
+.contrib-head .v{font-size:12.5px;font-weight:700;color:var(--muted);white-space:nowrap}
+.contrib-head .v.optimal{color:var(--good)}.contrib-head .v.good{color:var(--muted)}.contrib-head .v.attention{color:var(--warn)}
+.contrib-bar{display:block;height:6px;border-radius:999px;background:var(--track);overflow:hidden}
+.contrib-bar i{display:block;height:100%;border-radius:999px;background:var(--muted)}
+.contrib-bar i.optimal{background:var(--good)}.contrib-bar i.good{background:var(--accent)}.contrib-bar i.attention{background:var(--warn)}
+.contrib-note{display:block;margin-top:4px;font-size:11px;color:var(--faint)}
 .entry-actions{display:flex;justify-content:flex-end;margin-top:14px}.entry-form{display:none;margin-top:14px;padding:15px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2)}.entry-form.open{display:block}.entry-fields{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.injury-fields{grid-template-columns:repeat(3,1fr)}.entry-fields label{display:grid;gap:4px;font-size:12px;font-weight:700;color:var(--muted)}.entry-fields input{width:100%;border:1px solid var(--border);border-radius:9px;padding:9px;background:var(--surface);color:var(--text);font:inherit}.entry-submit{margin-top:12px;border:0;border-radius:999px;background:var(--accent);color:white;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer}.entry-status{margin:9px 0 0;font-size:12px;color:var(--muted)}.injurychart{width:100%;height:300px;display:block;margin-top:10px}.painlegend{display:flex;flex-wrap:wrap;gap:7px 14px;margin-top:12px;font-size:12px;color:var(--muted)}.painlegend span{display:flex;align-items:center;gap:5px}.painlegend i{width:9px;height:9px;border-radius:50%;display:inline-block}.pain-scale{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
 @media(max-width:640px){.entry-fields,.injury-fields{grid-template-columns:1fr 1fr}.injurychart{height:240px}.primarychart{height:250px}.loadchart text,.effortdaily text{font-size:21px!important}}@media(max-width:420px){.entry-fields,.injury-fields{grid-template-columns:1fr}}
 .strength-open{display:inline-flex;align-items:center;margin-top:5px;border:0;background:transparent;color:var(--accent);padding:2px 0;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer}.strength-card-action{margin-top:12px;width:100%;justify-content:center!important;box-shadow:none!important;background:var(--surface-2)!important}
@@ -1935,7 +2265,6 @@ button.rf svg{width:15px;height:15px}
 .muscle-card{margin-top:14px}.muscle-card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.muscle-card-head h3{font-size:15px;margin:0}.muscle-card-head p{font-size:11.5px;color:var(--muted);margin:2px 0 0}.muscle-week-nav{display:flex;align-items:center;gap:8px}.muscle-week-nav button{width:38px;height:38px;border:1px solid var(--border);border-radius:50%;background:var(--surface-2);color:var(--text);font-size:22px;line-height:1;cursor:pointer}.muscle-week-nav button:disabled{opacity:.35;cursor:default}.muscle-week-label{min-width:128px;text-align:center;font-size:12px;font-weight:750}.muscle-summary{font-size:12px;color:var(--muted);margin:10px 0 2px}.muscle-chart-wrap{width:100%;overflow-x:auto;overscroll-behavior-inline:contain}.musclechart{width:100%;height:300px;display:block}.muscle-scroll-hint{display:none}.muscle-legend{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:12px;color:var(--muted);margin:5px 0 0}.muscle-legend span{display:flex;align-items:center;gap:6px}.muscle-legend i{display:inline-block;width:11px;height:11px;border-radius:3px}.muscle-map{margin-top:13px;border-top:1px solid var(--border);padding-top:11px}.muscle-map summary{cursor:pointer;font-size:12.5px;font-weight:750;color:var(--text)}.muscle-table-wrap{overflow:auto;margin-top:9px}.muscle-table{width:100%;border-collapse:collapse;font-size:12px}.muscle-table th,.muscle-table td{text-align:left;padding:8px;border-bottom:1px solid var(--border);vertical-align:top}.muscle-table th{color:var(--faint);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em}.muscle-table td:nth-child(2){font-weight:750;text-align:center}.muscle-credit{display:inline-block;margin:1px 4px 1px 0;padding:2px 6px;border-radius:999px;background:var(--surface-2);white-space:nowrap}.muscle-unmapped{color:var(--warn)}
 @media(max-width:520px){.musclechart{width:720px;height:260px}.muscle-scroll-hint{display:block;margin:1px 0 5px;color:var(--faint);font-size:10.5px;text-align:right}.muscle-week-nav{width:100%;justify-content:space-between}.muscle-week-label{flex:1}.muscle-table{min-width:590px}}
 .svg-tip{position:fixed;z-index:20;pointer-events:none;background:var(--text);color:var(--surface);padding:7px 9px;border-radius:8px;font-size:12px;line-height:1.35;box-shadow:var(--shadow);transform:translate(12px,-115%);white-space:nowrap}.svg-tip[hidden]{display:none}.bbchart,.trendchart,.loadchart{cursor:crosshair}
-.hrvdots{display:flex;align-items:flex-end;justify-content:space-between;gap:8px;height:96px;padding:8px 3px 0}.hrvday{flex:1;min-width:0;text-align:center;color:var(--faint);font-size:10.5px}.hrvdot{display:block;width:15px;height:15px;border-radius:50%;margin:0 auto 7px;background:var(--faint);box-shadow:0 0 0 4px color-mix(in srgb,var(--faint) 12%,transparent)}.hrvdot.good{background:var(--good);box-shadow:0 0 0 4px color-mix(in srgb,var(--good) 14%,transparent)}.hrvdot.warn{background:var(--warn);box-shadow:0 0 0 4px color-mix(in srgb,var(--warn) 14%,transparent)}.hrvdot.low{background:var(--low);box-shadow:0 0 0 4px color-mix(in srgb,var(--low) 14%,transparent)}
 .twogrid{grid-template-columns:1.4fr 1fr}
 @media(max-width:820px){.twogrid{grid-template-columns:1fr}}
 footer{margin-top:26px;padding-top:15px;border-top:1px solid var(--border);color:var(--muted);font-size:12.5px;display:flex;flex-wrap:wrap;gap:6px 16px}
@@ -2174,7 +2503,7 @@ function loadPersonalRecommendation(d,refresh){
   var button=document.getElementById("refresh-recommendation");
   if(!target)return;
   if(refresh){target.textContent="Updating your recommendation…";if(button){button.disabled=true;button.textContent="Updating…";}}
-  var snapshot={date:d.date,wellness:d.wellness,body:d.body,injuries:d.injuries,recent:d.recent,sports:d.sports,relativeEffort:d.relativeEffort,strength:d.strength,muscleVolume:d.muscleVolume,fitnessSeries:d.fitnessSeries,trainingLoadTrend:d.trainingLoadTrend,sleepSeries:d.sleepSeries,hrvSeries:d.hrvSeries,hrZonesWeek:d.hrZonesWeek};
+  var snapshot={date:d.date,wellness:d.wellness,body:d.body,injuries:d.injuries,recent:d.recent,sports:d.sports,relativeEffort:d.relativeEffort,recovery:d.recovery,strength:d.strength,muscleVolume:d.muscleVolume,fitnessSeries:d.fitnessSeries,trainingLoadTrend:d.trainingLoadTrend,sleepSeries:d.sleepSeries,hrvSeries:d.hrvSeries,hrZonesWeek:d.hrZonesWeek};
   fetch("/api/recommendation",{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({dashboard:snapshot,refresh:!!refresh})})
     .then(function(r){return r.json().then(function(body){if(!r.ok)throw new Error(body.error||"Could not get a recommendation");return body;});})
     .then(function(result){target.textContent=result.text;target.parentElement.classList.add("ai-ready");})
@@ -2292,16 +2621,63 @@ function render(d){
   fitnessCard.innerHTML='<div class="label"><p class="eyebrow">Fitness level · Garmin-load model</p><span class="pill good" id="fit-value">'+n(latest.fitness)+' index</span></div><div class="charttabs" id="fit-tabs"><button data-days="30" class="active">1 month</button><button data-days="90">3 months</button><button data-days="180">6 months</button><button data-days="365">1 year</button><button data-days="731">2 years</button></div><div class="fitsummary" id="fit-summary"></div><svg class="loadchart primarychart" id="fitnessc" viewBox="0 0 1000 360" preserveAspectRatio="none"></svg><div class="metricnote">Click any point to compare it with the first day of the selected period. With no selection, today is used. Uses Garmin’s EPOC-based Training Load.</div>';
   response.appendChild(fitnessCard);app.appendChild(response);
 
-  // sleep + HRV history
-  app.appendChild(sec("Sleep & HRV · 7 days"));
+  // readiness contributors + sleep detail
+  var rec=d.recovery||{},debt=rec.debt||{},lastNight=rec.lastNight||{};
+  app.appendChild(sec("Readiness & sleep"));
+  var readinessCard=el("div","card");
+  var contribRows=(rec.contributors||[]).map(function(c){
+    var pct=Math.max(2,Math.min(100,c.percent));
+    return '<div class="contrib"><div class="contrib-head"><span class="k">'+c.label+'</span>'+
+      '<span class="v '+(c.grade||"")+'">'+(c.detail||"")+'</span></div>'+
+      '<span class="contrib-bar"><i class="'+(c.grade||"")+'" style="width:'+pct+'%"></i></span>'+
+      (c.note?'<span class="contrib-note">'+c.note+'</span>':'')+'</div>';
+  }).join("");
+  readinessCard.innerHTML='<div class="label"><p class="eyebrow">Readiness contributors</p>'+
+    (w.readiness?'<span class="pill '+((w.readiness.score||0)>=70?"good":(w.readiness.score||0)>=50?"warn":"low")+'">Garmin '+n(w.readiness.score)+'</span>':'')+'</div>'+
+    (contribRows||'<div class="meta" style="margin-top:8px">Contributors need overnight wrist wear — nothing recorded yet.</div>')+
+    (rec.missing?'<div class="metricnote">'+rec.missing+'</div>':'');
+  app.appendChild(readinessCard);
+
+  var sleepGrid=el("div","keycharts");
+  // sleep debt
+  var debtCard=el("div","card");
+  var debtLabel={none:"None",low:"Low",moderate:"Moderate",high:"High"}[debt.level]||"—";
+  debtCard.innerHTML='<div class="label"><p class="eyebrow">Sleep debt · '+n(rec.nights?rec.nights.length:0)+' nights</p>'+
+    '<span class="pill '+(debt.level==="none"?"good":debt.level==="low"?"warn":"low")+'">'+debtLabel+'</span></div>'+
+    '<div class="big"><span>'+fmtMinutes(debt.minutes)+'</span><span class="unit">behind</span></div>'+
+    '<div class="meta">Sleep need '+n(rec.sleepNeedHours)+' h · last night '+n(lastNight.hours)+' h'+
+      (lastNight.efficiency?' · '+lastNight.efficiency+'% efficient':'')+'</div>'+
+    '<svg class="loadchart" id="debtc" viewBox="0 0 1000 220" preserveAspectRatio="none"></svg>'+
+    '<div class="metricnote">'+n(rec.needModel)+' '+n(rec.debtModel)+'</div>';
+  sleepGrid.appendChild(debtCard);
+
+  // sleep stages
+  var stagesCard=el("div","card");
+  stagesCard.innerHTML='<div class="label"><p class="eyebrow">Sleep stages · nightly</p>'+
+    '<span class="pill mute">'+(lastNight.score?"Score "+lastNight.score:"—")+'</span></div>'+
+    '<svg class="loadchart primarychart" id="stagesc" viewBox="0 0 1000 300" preserveAspectRatio="none"></svg>'+
+    '<div class="zleg" id="stageleg"></div>'+
+    '<div class="metricnote">Awake time inside the sleep window is shown above the bar. Deep and REM are the stages most associated with recovery.</div>';
+  sleepGrid.appendChild(stagesCard);
+  app.appendChild(sleepGrid);
+
   var recoveryTrends=el("div","grid twogrid");
-  var sleepCard=el("div","card");
-  sleepCard.innerHTML='<div class="label"><p class="eyebrow">Sleep score</p><p class="eyebrow">Latest '+n((w.sleep||{}).score)+' · '+n((w.sleep||{}).hours)+' h</p></div><svg class="trendchart" id="sleepc" viewBox="0 0 1000 220" preserveAspectRatio="none"></svg><div class="trendaxis" id="sleepa"></div>';
-  recoveryTrends.appendChild(sleepCard);
+  // HRV against Garmin's balanced baseline
   var hrvCard=el("div","card"),hrvs=d.hrvSeries||[];
-  var dots=hrvs.map(function(x){var s=(x.status||"").toLowerCase(),cl=s.indexOf("balanc")>=0?"good":s.indexOf("unbalanc")>=0?"warn":s?"low":"";return '<div class="hrvday"><span class="hrvdot '+cl+'" title="'+cap(x.status)+' · '+n(x.value)+' ms"></span>'+x.label+'</div>';}).join("");
-  hrvCard.innerHTML='<div class="label"><p class="eyebrow">HRV status</p><span class="pill '+(((w.hrv||{}).status||"").toLowerCase().indexOf("balanc")>=0?"good":"warn")+'">'+cap((w.hrv||{}).status)+'</span></div><div class="hrvdots">'+(dots||'<div class="meta">No HRV data recorded.</div>')+'</div><div class="meta">Green balanced · orange unbalanced · red low</div>';
-  recoveryTrends.appendChild(hrvCard);app.appendChild(recoveryTrends);
+  var hrvNow=w.hrv||{},hrvWeek=hrvNow.weeklyAvg!=null?hrvNow.weeklyAvg:hrvNow.value;
+  hrvCard.innerHTML='<div class="label"><p class="eyebrow">HRV vs baseline · '+hrvs.length+' nights</p><span class="pill '+hrvPillClass(hrvNow.status)+'">'+(cap(hrvNow.status)||"No status")+'</span></div>'+
+    '<div class="big"><span>'+n(hrvWeek)+'</span><span class="unit">ms · 7-day average</span></div>'+
+    '<div class="meta">Last night '+n(hrvNow.value)+' ms'+(hrvNow.baselineLow?' · your balanced range '+Math.round(hrvNow.baselineLow)+'–'+Math.round(hrvNow.baselineHigh)+' ms':'')+'</div>'+
+    '<svg class="loadchart" id="hrvc" viewBox="0 0 1000 220" preserveAspectRatio="none"></svg>'+
+    '<div class="metricnote">Dots are nightly averages; the shaded band is Garmin’s balanced range for you. Garmin sets the status from your seven-day average, not a single night, so one low night does not move it.</div>';
+  recoveryTrends.appendChild(hrvCard);
+  // bed/wake consistency
+  var timingCard=el("div","card"),reg=rec.regularity||{};
+  timingCard.innerHTML='<div class="label"><p class="eyebrow">Sleep timing</p><span class="pill '+((reg.score||0)>=85?"good":(reg.score||0)>=70?"warn":"low")+'">'+(reg.score!=null?"Regularity "+reg.score:"—")+'</span></div>'+
+    '<svg class="loadchart" id="timingc" viewBox="0 0 1000 220" preserveAspectRatio="none"></svg>'+
+    '<div class="metricnote">Each bar spans bedtime to wake time.'+(reg.deviationMinutes!=null?' Your mid-sleep point drifts by about '+reg.deviationMinutes+' minutes night to night.':'')+' A steady schedule is the strongest lever on sleep quality.</div>';
+  recoveryTrends.appendChild(timingCard);
+  app.appendChild(recoveryTrends);
 
   // training load + HR zones
   app.appendChild(sec("Training load & zones"));
@@ -2368,7 +2744,10 @@ function render(d){
   drawVo2(w.vo2maxRun,w.vo2RatingAge);
   drawBB(d.bodyBatterySeries||[]);
   drawTL(d.trainingLoadTrend||[]);
-  drawTrend("sleepc","sleepa",d.sleepSeries||[],"score");
+  drawDebt(rec.debt||{});
+  drawStages((rec.nights||[]).slice(-14));
+  drawHrv((d.hrvSeries||[]).slice(-60));
+  drawTiming((rec.nights||[]).slice(-14));
   drawEffort(re);
   drawFitness(fs,30);
   drawInjuries((d.injuries||{}).records||[]);
@@ -2406,18 +2785,175 @@ function drawTL(trend){
   chartTip(svg,trend,function(x){return '<b>'+x.label+'</b><br>'+Math.round(x.load)+' Garmin Training Load';});
 }
 
-function drawTrend(svgId,axisId,series,key){
-  var svg=document.getElementById(svgId);if(!svg||!series.length)return;
-  var W=1000,H=220,p=24,values=series.map(function(x){return x[key];}).filter(function(v){return v!=null;});if(!values.length)return;
-  var lo=Math.max(0,Math.min.apply(null,values)-10),hi=Math.min(100,Math.max.apply(null,values)+10),range=Math.max(1,hi-lo);
-  function X(i){return series.length===1?W/2:i/(series.length-1)*(W-p*2)+p;}function Y(v){return p+(hi-v)/range*(H-p*2);}
-  [lo,(lo+hi)/2,hi].forEach(function(v){var l=document.createElementNS(ns,"line");l.setAttribute("x1",p);l.setAttribute("x2",W-p);l.setAttribute("y1",Y(v));l.setAttribute("y2",Y(v));l.setAttribute("stroke",css("--border"));l.setAttribute("stroke-width",1);svg.appendChild(l);var t=document.createElementNS(ns,"text");t.setAttribute("x",1);t.setAttribute("y",Y(v)+4);t.setAttribute("font-size",16);t.setAttribute("fill",css("--faint"));t.textContent=Math.round(v);svg.appendChild(t);});
-  var pts=[];series.forEach(function(x,i){if(x[key]!=null)pts.push([X(i),Y(x[key]),x]);});if(!pts.length)return;
-  var line=pts.map(function(x,i){return (i?"L":"M")+x[0].toFixed(1)+" "+x[1].toFixed(1);}).join(" ");
-  var path=document.createElementNS(ns,"path");path.setAttribute("d",line);path.setAttribute("fill","none");path.setAttribute("stroke",css("--accent-2"));path.setAttribute("stroke-width",3);path.setAttribute("stroke-linecap","round");svg.appendChild(path);
-  pts.forEach(function(x){var dot=document.createElementNS(ns,"circle");dot.setAttribute("cx",x[0]);dot.setAttribute("cy",x[1]);dot.setAttribute("r",5);dot.setAttribute("fill",css("--accent-2"));dot.setAttribute("stroke",css("--surface"));dot.setAttribute("stroke-width",3);svg.appendChild(dot);});
-  document.getElementById(axisId).innerHTML=series.map(function(x){return '<span>'+x.label+'</span>';}).join("");chartTip(svg,series,function(x){return '<b>'+x.label+'</b><br>Sleep score: '+n(x.score)+'<br>Sleep: '+n(x.hours)+' h';});
+// Garmin's own wording drives the colour. An unknown or missing status must
+// stay neutral rather than defaulting to a warning the data does not support.
+function hrvPillClass(status){
+  var s=(status||"").toLowerCase();
+  if(!s)return "mute";
+  if(s.indexOf("unbalanc")>=0)return "warn";
+  if(s.indexOf("balanc")>=0)return "good";
+  if(s.indexOf("low")>=0||s.indexOf("poor")>=0)return "low";
+  return "mute";
 }
+
+function fmtMinutes(mins){
+  if(mins==null)return "—";
+  var m=Math.round(mins);if(m<60)return m+"m";
+  return Math.floor(m/60)+"h "+(m%60)+"m";
+}
+function fmtClock(hours){
+  if(hours==null)return "";
+  var h=((Math.floor(hours)%24)+24)%24,m=Math.round((hours-Math.floor(hours))*60);
+  if(m===60){m=0;h=(h+1)%24;}
+  return (h<10?"0":"")+h+":"+(m<10?"0":"")+m;
+}
+
+// Sleep debt over the rolling window, with Oura-style severity bands.
+function drawDebt(debt){
+  var svg=document.getElementById("debtc"),rows=(debt||{}).series||[];if(!svg||!rows.length)return;svg.innerHTML="";
+  var W=1000,H=220,pL=46,pR=16,pT=18,pB=34,bands=(debt.bands||[30,120,300]);
+  var max=Math.max.apply(null,rows.map(function(x){return x.minutes;}).concat([bands[1]]))*1.2;
+  function Y(v){return pT+(max-v)/max*(H-pT-pB)}
+  var shades=[["good",0,bands[0]],["warn",bands[0],bands[1]],["low",bands[1],max]];
+  shades.forEach(function(b){
+    if(b[1]>=max)return;
+    var r=document.createElementNS(ns,"rect");r.setAttribute("x",pL);r.setAttribute("width",W-pL-pR);
+    r.setAttribute("y",Y(Math.min(b[2],max)));r.setAttribute("height",Math.max(0,Y(b[1])-Y(Math.min(b[2],max))));
+    r.setAttribute("fill",css("--"+b[0]));r.setAttribute("opacity",".09");svg.appendChild(r);
+  });
+  var line=rows.map(function(x,i){return(i?"L":"M")+(pL+i*(W-pL-pR)/Math.max(1,rows.length-1)).toFixed(1)+" "+Y(x.minutes).toFixed(1);}).join(" ");
+  var p=document.createElementNS(ns,"path");p.setAttribute("d",line);p.setAttribute("fill","none");
+  p.setAttribute("stroke",css("--accent"));p.setAttribute("stroke-width",4);p.setAttribute("stroke-linejoin","round");svg.appendChild(p);
+  rows.forEach(function(x,i){
+    var cx=pL+i*(W-pL-pR)/Math.max(1,rows.length-1),last=i===rows.length-1;
+    var c=document.createElementNS(ns,"circle");c.setAttribute("cx",cx);c.setAttribute("cy",Y(x.minutes));
+    c.setAttribute("r",last?8:4);c.setAttribute("fill",last?css("--accent"):css("--surface"));
+    c.setAttribute("stroke",css("--accent"));c.setAttribute("stroke-width",3);svg.appendChild(c);
+    if(i%3===0||last){var t=document.createElementNS(ns,"text");t.setAttribute("x",cx);t.setAttribute("y",H-9);
+      t.setAttribute("text-anchor",last?"end":i===0?"start":"middle");t.setAttribute("font-size",16);
+      t.setAttribute("fill",last?css("--accent"):css("--faint"));t.textContent=x.label;svg.appendChild(t);}
+  });
+  var lastLabelY=null;
+  [0].concat(bands).forEach(function(v){
+    if(v>max)return;
+    var y=Y(v);
+    if(lastLabelY!==null&&Math.abs(y-lastLabelY)<20)return;  // keep labels legible on a phone
+    lastLabelY=y;
+    var t=document.createElementNS(ns,"text");t.setAttribute("x",pL-8);t.setAttribute("y",y+5);
+    t.setAttribute("text-anchor","end");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));
+    t.textContent=v===0?"0":fmtMinutes(v).replace(" ","");svg.appendChild(t);
+  });
+  chartTip(svg,rows,function(x){return '<b>'+x.label+'</b><br>'+fmtMinutes(x.minutes)+' of sleep debt';});
+}
+
+// Stacked nightly sleep stages, with awake time floated above the asleep total.
+function drawStages(nights){
+  var svg=document.getElementById("stagesc");if(!svg||!nights.length)return;svg.innerHTML="";
+  var W=1000,H=300,pL=52,pR=16,pT=24,pB=40,slot=(W-pL-pR)/nights.length,bw=Math.min(46,slot*0.6);
+  var order=[["deep","--accent-2","Deep"],["rem","--accent","REM"],["light","--bike","Light"]];
+  var max=Math.max.apply(null,nights.map(function(x){var s=x.stages||{};return (s.deep||0)+(s.rem||0)+(s.light||0)+(s.awake||0);}).concat([420]))*1.12;
+  function Y(v){return pT+(max-v)/max*(H-pT-pB)}
+  [0,240,480].forEach(function(v){
+    if(v>max)return;var l=document.createElementNS(ns,"line");l.setAttribute("x1",pL);l.setAttribute("x2",W-pR);
+    l.setAttribute("y1",Y(v));l.setAttribute("y2",Y(v));l.setAttribute("stroke",css("--border"));svg.appendChild(l);
+    var t=document.createElementNS(ns,"text");t.setAttribute("x",pL-8);t.setAttribute("y",Y(v)+5);t.setAttribute("text-anchor","end");
+    t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));t.textContent=(v/60)+"h";svg.appendChild(t);
+  });
+  nights.forEach(function(night,i){
+    var s=night.stages||{},bx=pL+i*slot+(slot-bw)/2,base=0;
+    order.forEach(function(stage){
+      var mins=s[stage[0]]||0;if(mins<=0)return;
+      var r=document.createElementNS(ns,"rect");r.setAttribute("x",bx);r.setAttribute("width",bw);
+      r.setAttribute("y",Y(base+mins));r.setAttribute("height",Math.max(1,Y(base)-Y(base+mins)));
+      r.setAttribute("fill",css(stage[1]));svg.appendChild(r);
+      var ttl=document.createElementNS(ns,"title");ttl.textContent=night.label+" "+stage[2]+": "+fmtMinutes(mins);r.appendChild(ttl);
+      base+=mins;
+    });
+    if(s.awake>0){
+      var a=document.createElementNS(ns,"rect");a.setAttribute("x",bx);a.setAttribute("width",bw);
+      a.setAttribute("y",Y(base+s.awake));a.setAttribute("height",Math.max(1,Y(base)-Y(base+s.awake)));
+      a.setAttribute("fill",css("--track"));svg.appendChild(a);
+    }
+    var t=document.createElementNS(ns,"text");t.setAttribute("x",bx+bw/2);t.setAttribute("y",H-12);
+    t.setAttribute("text-anchor","middle");t.setAttribute("font-size",16);t.setAttribute("fill",css("--faint"));
+    t.textContent=night.label;svg.appendChild(t);
+  });
+  var leg=document.getElementById("stageleg");
+  if(leg)leg.innerHTML=order.concat([["awake","--track","Awake"]]).map(function(s){
+    return '<div class="z"><span class="sw" style="background:'+css(s[1])+'"></span>'+s[2]+'</div>';}).join("");
+  chartTip(svg,nights,function(x){var s=x.stages||{};
+    return '<b>'+x.label+'</b> · '+n(x.hours)+' h<br>Deep '+fmtMinutes(s.deep)+' · REM '+fmtMinutes(s.rem)+
+      '<br>Light '+fmtMinutes(s.light)+' · Awake '+fmtMinutes(s.awake)+
+      (x.efficiency?'<br>Efficiency '+x.efficiency+'%':'');});
+}
+
+// Overnight HRV against Garmin's own balanced range.
+function drawHrv(series){
+  var svg=document.getElementById("hrvc");if(!svg||!series.length)return;svg.innerHTML="";
+  var W=1000,H=220,pL=44,pR=14,pT=16,pB=32;
+  var vals=series.map(function(x){return x.value;}).filter(function(v){return v!=null;});if(!vals.length)return;
+  var lo=Math.min.apply(null,vals.concat(series.map(function(x){return x.baselineLow||999;})))*0.85;
+  var hi=Math.max.apply(null,vals.concat(series.map(function(x){return x.baselineHigh||0;})))*1.1;
+  var range=Math.max(1,hi-lo);
+  function X(i){return series.length===1?W/2:pL+i*(W-pL-pR)/(series.length-1)}
+  function Y(v){return pT+(hi-v)/range*(H-pT-pB)}
+  var banded=series.map(function(x,i){return{x:x,i:i};}).filter(function(v){return v.x.baselineLow!=null&&v.x.baselineHigh!=null;});
+  if(banded.length>1){
+    var up=banded.map(function(v,k){return(k?"L":"M")+X(v.i).toFixed(1)+" "+Y(v.x.baselineHigh).toFixed(1);}).join(" ");
+    var dn=banded.slice().reverse().map(function(v){return"L"+X(v.i).toFixed(1)+" "+Y(v.x.baselineLow).toFixed(1);}).join(" ");
+    var band=document.createElementNS(ns,"path");band.setAttribute("d",up+" "+dn+" Z");band.setAttribute("class","rangeband");svg.appendChild(band);
+  }
+  var pts=[];series.forEach(function(x,i){if(x.value!=null)pts.push([X(i),Y(x.value),x]);});
+  var path=document.createElementNS(ns,"path");
+  path.setAttribute("d",pts.map(function(p,i){return(i?"L":"M")+p[0].toFixed(1)+" "+p[1].toFixed(1);}).join(" "));
+  path.setAttribute("fill","none");path.setAttribute("stroke",css("--accent-2"));path.setAttribute("stroke-width",3);
+  path.setAttribute("stroke-linejoin","round");svg.appendChild(path);
+  var last=pts[pts.length-1];
+  if(last){var c=document.createElementNS(ns,"circle");c.setAttribute("cx",last[0]);c.setAttribute("cy",last[1]);
+    c.setAttribute("r",7);c.setAttribute("fill",css("--accent-2"));c.setAttribute("stroke",css("--surface"));
+    c.setAttribute("stroke-width",3);svg.appendChild(c);}
+  [lo+range*0.1,hi-range*0.1].forEach(function(v){
+    var t=document.createElementNS(ns,"text");t.setAttribute("x",pL-8);t.setAttribute("y",Y(v)+5);
+    t.setAttribute("text-anchor","end");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));
+    t.textContent=Math.round(v);svg.appendChild(t);});
+  chartTip(svg,series,function(x){return '<b>'+x.label+'</b><br>'+n(x.value)+' ms'+
+    (x.baselineLow?'<br>Balanced '+Math.round(x.baselineLow)+'–'+Math.round(x.baselineHigh)+' ms':'')+
+    (x.status?'<br>'+cap(x.status):'');});
+}
+
+// Bed-to-wake spans, so an irregular schedule is visible at a glance.
+function drawTiming(nights){
+  var svg=document.getElementById("timingc");if(!svg)return;svg.innerHTML="";
+  var rows=nights.filter(function(x){return x.bedTime!=null&&x.wakeTime!=null;});if(!rows.length)return;
+  // Wider gutter than the other charts: "21:00" needs more room than a number.
+  var W=1000,H=220,pL=66,pR=14,pT=18,pB=32,slot=(W-pL-pR)/rows.length,bw=Math.min(38,slot*0.5);
+  // Plot on an 18:00 -> 12:00 axis so a night reads left-to-right without wrapping.
+  var START=18,SPAN=18;
+  function Y(hour){var h=hour<START?hour+24:hour;return pT+((h-START)/SPAN)*(H-pT-pB);}
+  [21,0,3,6,9].forEach(function(h){
+    var y=Y(h),l=document.createElementNS(ns,"line");l.setAttribute("x1",pL);l.setAttribute("x2",W-pR);
+    l.setAttribute("y1",y);l.setAttribute("y2",y);l.setAttribute("stroke",css("--border"));svg.appendChild(l);
+    var t=document.createElementNS(ns,"text");t.setAttribute("x",pL-8);t.setAttribute("y",y+5);
+    t.setAttribute("text-anchor","end");t.setAttribute("font-size",14);t.setAttribute("fill",css("--faint"));
+    t.textContent=fmtClock(h);svg.appendChild(t);
+  });
+  rows.forEach(function(night,i){
+    var bx=pL+i*slot+(slot-bw)/2,y1=Y(night.bedTime),y2=Y(night.wakeTime);
+    if(y2<y1){var swap=y1;y1=y2;y2=swap;}
+    var r=document.createElementNS(ns,"rect");r.setAttribute("x",bx);r.setAttribute("width",bw);
+    r.setAttribute("y",y1);r.setAttribute("height",Math.max(3,y2-y1));r.setAttribute("rx",5);
+    r.setAttribute("fill",css("--accent"));r.setAttribute("opacity",".85");svg.appendChild(r);
+    var ttl=document.createElementNS(ns,"title");
+    ttl.textContent=night.label+": "+fmtClock(night.bedTime)+" – "+fmtClock(night.wakeTime);r.appendChild(ttl);
+    if(i%2===0||rows.length<8){
+      var t=document.createElementNS(ns,"text");t.setAttribute("x",bx+bw/2);t.setAttribute("y",H-9);
+      t.setAttribute("text-anchor","middle");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));
+      t.textContent=night.label;svg.appendChild(t);}
+  });
+  chartTip(svg,rows,function(x){return '<b>'+x.label+'</b><br>'+fmtClock(x.bedTime)+' – '+fmtClock(x.wakeTime)+
+    '<br>'+n(x.hours)+' h asleep';});
+}
+
 
 function effortStateText(week){
   if(week.partial)return {within:"On pace",below:"Behind pace",above:"Ahead of pace"}[week.state]||"Building baseline";
