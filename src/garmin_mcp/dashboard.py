@@ -1191,6 +1191,12 @@ def _hrv_values(payload):
 # are treated as walks (the user walks around 80–100 bpm and runs 125+).
 TREADMILL_RUN_HR = 120
 
+# Relative Effort capacity response, in weeks, and the per-week decay applied to
+# the trailing deviation that widens the top of the suggested range.
+CAPACITY_RISE_WEEKS = 6.0
+CAPACITY_FALL_WEEKS = 3.0
+SIGMA_DECAY = 0.7
+
 
 def _sport_of(type_key):
     k = (type_key or "").lower()
@@ -1617,12 +1623,18 @@ def gather(client):
         # The band floor tracks capacity, but the ceiling also widens with the
         # volatility of the trailing six completed weeks (Strava-like): erratic
         # recent training stretches the acceptable top end, while consistent
-        # weeks keep the band at the plain 80-130% of capacity.
+        # weeks keep the band at the plain 80-130% of capacity. The deviation is
+        # exponentially weighted so a spike widens the band sharply and then
+        # relaxes week by week, instead of holding full width for six weeks and
+        # collapsing the moment it leaves the window.
         recent = prior_efforts[-6:]
         sigma = 0.0
         if len(recent) >= 3:
-            mean = sum(recent) / len(recent)
-            sigma = (sum((value - mean) ** 2 for value in recent) / len(recent)) ** 0.5
+            weights = [SIGMA_DECAY ** (len(recent) - 1 - offset) for offset in range(len(recent))]
+            total = sum(weights)
+            mean = sum(value * weight for value, weight in zip(recent, weights)) / total
+            sigma = (sum(weight * (value - mean) ** 2
+                         for value, weight in zip(recent, weights)) / total) ** 0.5
         low_raw = capacity * 0.8
         high_raw = min(capacity * 2.5, max(capacity * 1.3, capacity + 1.3 * sigma))
         state = "below" if effort < low_raw else "above" if effort > high_raw else "within"
@@ -1642,7 +1654,11 @@ def gather(client):
                 })
         if not is_current:  # current partial week cannot set its own target
             prior_efforts.append(effort)
-            blended = capacity + (effort - capacity) / 6.0
+            # Asymmetric response: capacity is slow to claim new fitness but
+            # gives it up faster, so a quiet block settles the band onto the
+            # training actually being done instead of trailing months behind it.
+            response = CAPACITY_FALL_WEEKS if state == "below" else CAPACITY_RISE_WEEKS
+            blended = capacity + (effort - capacity) / response
             if state == "within":
                 capacity = max(blended, capacity * 1.03)
             elif state == "above":
@@ -1658,7 +1674,7 @@ def gather(client):
         "baseline": current["capacity"], "days": current["days"],
         "activities": current["activities"],
         "formula": "Each activity scores aerobic minutes by HR zone (below Z1 0.12 · Z1 0.2 · Z2 0.4 · Z3 0.8 · Z4 1.4 · Z5 2.2 points/min) plus Garmin Training Load ÷ 8 for interval intensity — no sport multipliers, so the points are comparable with Strava Relative Effort. Garmin Load ÷ 3 when no heart rate was recorded.",
-        "rangeModel": "The shaded band is the suggested weekly range. Its floor is 80% of adaptive capacity (a ~6-week response that rises after weeks inside or above the band); its ceiling is 130% of capacity, stretched further when the trailing six weeks were erratic (capacity + 1.3× their standard deviation, capped at 2.5× capacity), so big recent weeks widen the acceptable top end. The current week is judged against the band prorated by days elapsed.",
+        "rangeModel": "The shaded band is the suggested weekly range. Its floor is 80% of adaptive capacity, which climbs over ~6 weeks after weeks inside or above the band but eases back over ~3 when you train under it, so the band follows a quieter block instead of trailing months behind it. The ceiling is 130% of capacity, stretched further when recent weeks were erratic (capacity + 1.3× the recency-weighted deviation of the last six weeks, capped at 2.5× capacity) — a big week widens the top sharply, then relaxes week by week. The current week is judged against the band prorated by days elapsed.",
     }
 
     # ---- HR zones this week (minutes per zone) ----
