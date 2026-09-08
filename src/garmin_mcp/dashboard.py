@@ -2799,7 +2799,8 @@ function hrvPillClass(status){
 function fmtMinutes(mins){
   if(mins==null)return "—";
   var m=Math.round(mins);if(m<60)return m+"m";
-  return Math.floor(m/60)+"h "+(m%60)+"m";
+  var h=Math.floor(m/60);
+  return m%60?h+"h "+(m%60)+"m":h+"h";   // a whole hour reads better without "0m"
 }
 function fmtClock(hours){
   if(hours==null)return "";
@@ -2811,7 +2812,9 @@ function fmtClock(hours){
 // Sleep debt over the rolling window, with Oura-style severity bands.
 function drawDebt(debt){
   var svg=document.getElementById("debtc"),rows=(debt||{}).series||[];if(!svg||!rows.length)return;svg.innerHTML="";
-  var W=1000,H=220,pL=46,pR=16,pT=18,pB=34,bands=(debt.bands||[30,120,300]);
+  // The gutter holds durations such as "5h" or "30m", so it needs more room
+  // than the numeric axes elsewhere on the page.
+  var W=1000,H=220,pL=72,pR=16,pT=18,pB=34,bands=(debt.bands||[30,120,300]);
   var max=Math.max.apply(null,rows.map(function(x){return x.minutes;}).concat([bands[1]]))*1.2;
   function Y(v){return pT+(max-v)/max*(H-pT-pB)}
   var shades=[["good",0,bands[0]],["warn",bands[0],bands[1]],["low",bands[1],max]];
@@ -2841,7 +2844,7 @@ function drawDebt(debt){
     lastLabelY=y;
     var t=document.createElementNS(ns,"text");t.setAttribute("x",pL-8);t.setAttribute("y",y+5);
     t.setAttribute("text-anchor","end");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));
-    t.textContent=v===0?"0":fmtMinutes(v).replace(" ","");svg.appendChild(t);
+    t.textContent=v===0?"0":fmtMinutes(v);svg.appendChild(t);
   });
   chartTip(svg,rows,function(x){return '<b>'+x.label+'</b><br>'+fmtMinutes(x.minutes)+' of sleep debt';});
 }
