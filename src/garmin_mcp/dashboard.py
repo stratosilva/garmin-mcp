@@ -2247,6 +2247,10 @@ button.rf svg{width:15px;height:15px}
 .hydro .bar{margin-top:10px}
 .loadchart,.effortdaily{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}.loadchart{width:100%;height:190px;display:block;margin-top:8px}.loadchart text,.effortdaily text{font-family:inherit!important;font-size:19px!important;font-weight:600;letter-spacing:.01em}.primarychart{height:300px;margin-top:12px}.keycharts{display:grid;grid-template-columns:1fr;gap:16px}.rangeband{fill:color-mix(in srgb,var(--accent) 18%,transparent)}.charttabs{display:flex;gap:6px;flex-wrap:wrap}.charttabs button{border:1px solid var(--border);background:var(--surface-2);color:var(--muted);border-radius:999px;padding:5px 9px;font-size:11px;font-weight:700;cursor:pointer}.charttabs button.active{background:var(--accent);border-color:var(--accent);color:#fff}.metricnote{font-size:12px;color:var(--muted);margin-top:8px}
 .effortdetail{margin-top:14px;padding-top:13px;border-top:1px solid var(--border)}.effortdaily{width:100%;height:120px;display:block;margin-top:4px;cursor:crosshair}.effortlist{display:grid;gap:7px;margin-top:12px}.effortrow{display:flex;justify-content:space-between;gap:14px;padding:9px 11px;border-radius:10px;background:var(--surface-2);font-size:12.5px;color:var(--muted)}.effortrow b{color:var(--text)}.effortrow small{color:var(--faint);font-size:11.5px}.effortrow .score{white-space:nowrap;color:var(--accent);font-weight:750}.effortrow .score.hi{color:var(--warn)}.effortrow .score.max{color:var(--low)}.fitsummary{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-top:12px}.fitsummary .change{font-size:28px;font-weight:800}.fitsummary .up{color:var(--good)}.fitsummary .period{width:100%;color:var(--muted);font-size:12.5px}
+.factor{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-top:9px;padding-top:9px;border-top:1px solid var(--border)}
+.factor .fl{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);white-space:nowrap}
+.factor .fv{font-size:12.5px;font-weight:700;text-align:right;color:var(--text)}
+.factor .fv.optimal{color:var(--good)}.factor .fv.attention{color:var(--warn)}
 .contrib{margin-top:13px}.contrib:first-of-type{margin-top:10px}
 .contrib-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:5px}
 .contrib-head .k{font-size:13px;font-weight:650}
@@ -2556,14 +2560,31 @@ function render(d){
     '<div class="ringwrap"><svg class="ring" id="ring" viewBox="0 0 120 120"></svg>'+
     '<div class="ringlabel"><div class="n">'+comma(steps.value)+'</div><div class="d">of '+comma(steps.goal)+' goal</div>'+
     '<div class="d" style="margin-top:6px">7-day avg '+comma(steps.avg7)+' · '+n(w.distanceKm)+' km</div></div></div>';
-  // recovery / sleep card
-  var rec=el("div","card");
+  // Recovery summary. The contributor list below reports every signal; this
+  // card exists to answer the two questions you have before scrolling — what
+  // should I do today, and which signal is holding me back.
+  var rec=el("div","card"),contribs=((d.recovery||{}).contributors||[]).slice();
   if(w.sleep||w.hrv||w.readiness){
-    var rows="";
-    if(w.readiness) rows+='<div class="row"><span class="k">Readiness</span><span class="bar"><i style="width:'+(w.readiness.score||0)+'%"></i></span><span class="v">'+n(w.readiness.score)+'</span></div>';
-    if(w.sleep) rows+='<div class="row"><span class="k">Sleep</span><span class="bar"><i style="width:'+(w.sleep.score||Math.min(100,(w.sleep.hours||0)/8*100))+'%"></i></span><span class="v">'+n(w.sleep.score)+' / '+n(w.sleep.hours)+'h</span></div>';
-    if(w.hrv) rows+='<div class="row"><span class="k">HRV</span><span class="bar"><i style="width:60%"></i></span><span class="v">'+n(w.hrv.value)+' '+cap(w.hrv.status)+'</span></div>';
-    rec.innerHTML='<div class="label"><p class="eyebrow">Recovery</p><span class="pill '+(d.workoutRecommendation&&d.workoutRecommendation.level==="recover"?"low":d.workoutRecommendation&&d.workoutRecommendation.level==="easy"?"warn":"good")+'">'+(d.workoutRecommendation?d.workoutRecommendation.label:"")+'</span></div>'+rows;
+    var wr=d.workoutRecommendation||{};
+    var ranked=contribs.filter(function(c){return c.percent!=null;})
+                       .sort(function(a,b){return a.percent-b.percent;});
+    var weakest=ranked[0],strongest=ranked[ranked.length-1];
+    var debtMin=((d.recovery||{}).debt||{}).minutes;
+    var body='<div class="label"><p class="eyebrow">Recovery</p><span class="pill '+
+      (wr.level==="recover"?"low":wr.level==="easy"?"warn":"good")+'">'+n(wr.label)+'</span></div>';
+    if(w.readiness) body+='<div class="big"><span>'+n(w.readiness.score)+'</span><span class="unit">readiness</span></div>';
+    if(weakest&&strongest&&weakest!==strongest){
+      // Only call something a limiting factor when it actually holds you back;
+      // with every signal optimal there is nothing to single out.
+      var weakLabel=weakest.grade==="optimal"?"Lowest today":weakest.grade==="good"?"Worth watching":"Limiting factor";
+      body+='<div class="factor"><span class="fl">'+weakLabel+'</span>'+
+        '<span class="fv '+(weakest.grade||"")+'">'+weakest.label+(weakest.detail?' · '+weakest.detail:'')+'</span></div>'+
+        '<div class="factor"><span class="fl">Strongest</span>'+
+        '<span class="fv '+(strongest.grade||"")+'">'+strongest.label+(strongest.detail?' · '+strongest.detail:'')+'</span></div>';
+    }
+    if(debtMin!=null&&debtMin>0) body+='<div class="factor"><span class="fl">Sleep debt</span><span class="fv">'+fmtMinutes(debtMin)+' behind</span></div>';
+    if(wr.text) body+='<div class="metricnote">'+wr.text+'</div>';
+    rec.innerHTML=body;
   } else {
     rec.innerHTML='<div class="label"><p class="eyebrow">Recovery</p><span class="pill mute">No wear</span></div>'+
       '<div class="meta" style="margin-top:8px">Sleep, HRV & readiness need overnight wrist wear — none recorded for this night.</div>';
