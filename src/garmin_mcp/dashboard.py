@@ -411,12 +411,13 @@ def _read_strength_log_unlocked():
     try:
         payload = json.loads(_strength_log_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        return {"version": 1, "activities": {}, "manualWorkouts": {}}
+        return {"version": 1, "activities": {}, "manualWorkouts": {}, "manualActivities": {}}
     if not isinstance(payload, dict) or not isinstance(payload.get("activities"), dict):
-        return {"version": 1, "activities": {}, "manualWorkouts": {}}
+        return {"version": 1, "activities": {}, "manualWorkouts": {}, "manualActivities": {}}
     payload["version"] = 1
     payload.setdefault("activities", {})
     payload.setdefault("manualWorkouts", {})
+    payload.setdefault("manualActivities", {})
     return payload
 
 
@@ -447,6 +448,23 @@ def _save_manual_strength_workout_unlocked(manual_id, entry):
         return
     store = _read_strength_log_unlocked()
     store["manualWorkouts"][manual_id] = entry
+    _write_strength_log_unlocked(store)
+
+
+def _manual_endurance_activities_unlocked():
+    db = _dashboard_database()
+    if db:
+        return db.manual_endurance_activities()
+    return _read_strength_log_unlocked().get("manualActivities", {})
+
+
+def _save_manual_endurance_activity_unlocked(manual_id, entry):
+    db = _dashboard_database()
+    if db:
+        db.save_manual_endurance_activity(manual_id, entry)
+        return
+    store = _read_strength_log_unlocked()
+    store["manualActivities"][manual_id] = entry
     _write_strength_log_unlocked(store)
 
 
@@ -784,6 +802,62 @@ def _manual_workout_activity(entry, garmin_activities):
             activity["start"] = garmin.get("start") or activity["start"]
             activity["estimate"] = None
     return activity
+
+
+def _manual_endurance_calories(sport, minutes, weight_kg=70.0):
+    # Standard MET approximation. It deliberately separates walking from running.
+    met = {"walk": 3.5, "bike": 6.0, "run": 9.8}[sport]
+    return round(met * 3.5 * weight_kg / 200.0 * minutes)
+
+
+def _save_manual_endurance_activity(manual_id, payload):
+    if not isinstance(payload, dict):
+        raise ValueError("activity details are required")
+    sport = str(payload.get("sport") or "").lower()
+    if sport not in {"bike", "run", "walk"}:
+        raise ValueError("choose bike, run, or walk")
+    minutes = _strength_number(payload.get("minutes"), "minutes", 1, 1440)
+    distance_km = _strength_number(payload.get("distanceKm"), "distance", 0, 1000)
+    calories = _strength_number(payload.get("calories"), "calories", 0, 20000)
+    if minutes is None or distance_km is None:
+        raise ValueError("distance and time are required")
+    weight_kg = _strength_number(payload.get("weightKg"), "body weight", 30, 300) or 70.0
+    estimated = calories is None
+    calories = calories if calories is not None else _manual_endurance_calories(sport, minutes, weight_kg)
+    start = _strength_text(payload.get("activityStart"), "activity start", 50) or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    names = {"bike": "Manual bike", "run": "Manual run", "walk": "Manual walk"}
+    entry = {"manualId": manual_id, "sport": sport,
+             "activityName": _strength_text(payload.get("activityName"), "activity name") or names[sport],
+             "activityStart": start, "minutes": minutes, "distanceKm": distance_km,
+             "calories": calories, "caloriesEstimated": estimated, "weightKg": weight_kg,
+             "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    with _STRENGTH_LOG_LOCK:
+        _save_manual_endurance_activity_unlocked(manual_id, entry)
+    return entry
+
+
+def _manual_endurance_activity(entry):
+    minutes, km = entry.get("minutes") or 0, entry.get("distanceKm") or 0
+    pace = round(minutes / km, 2) if km else None
+    # No heart rate means estimated effort is conservative and clearly separate from Garmin load.
+    effort = round(minutes * {"walk": .12, "bike": .2, "run": .35}.get(entry.get("sport"), .1), 1)
+    sport = entry.get("sport")
+    default_hr = {"walk": 100, "run": 145}.get(sport)
+    return {"activityId": "manual-endurance:" + str(entry.get("manualId")), "manualEnduranceId": entry.get("manualId"),
+            "source": "manual", "sport": entry.get("sport"), "typeKey": "manual_" + str(entry.get("sport")),
+            "isStrength": False, "name": entry.get("activityName"), "date": str(entry.get("activityStart") or "")[:10],
+            "start": entry.get("activityStart"), "km": km, "min": minutes, "hr": default_hr, "maxHr": None,
+            "cal": entry.get("calories"), "caloriesEstimated": bool(entry.get("caloriesEstimated")), "pace": pace,
+            "load": None, "zones": [0, 0, 0, 0, 0], "effort": effort, "effortZonePart": None,
+            "effortLoadPart": None, "location": None, "totalSets": None, "totalReps": None, "totalVolumeGrams": None}
+
+
+def _manual_endurance_steps(entry, height_cm=185.0):
+    """Distance-based estimate; walk/run stride lengths scale with recorded height."""
+    if entry.get("sport") not in {"walk", "run"}:
+        return 0
+    stride_m = height_cm * (0.415 if entry.get("sport") == "walk" else 0.65) / 100.0
+    return round((float(entry.get("distanceKm") or 0) * 1000) / stride_m) if stride_m else 0
 
 
 def _manual_strength_payload(manual_id):
@@ -2036,17 +2110,29 @@ def gather(client):
     acts = [_map_activity(a) for a in raw if isinstance(a, dict)]
     with _STRENGTH_LOG_LOCK:
         manual_entries = list(_manual_strength_workouts_unlocked().values())
+        manual_endurance_entries = list(_manual_endurance_activities_unlocked().values())
     manual_activities = [_manual_workout_activity(entry, acts) for entry in manual_entries if isinstance(entry, dict)]
+    manual_endurance = [_manual_endurance_activity(entry) for entry in manual_endurance_entries if isinstance(entry, dict)]
+    manual_steps_by_date = {}
+    for entry in manual_endurance_entries:
+        if isinstance(entry, dict):
+            date = str(entry.get("activityStart") or "")[:10]
+            manual_steps_by_date[date] = manual_steps_by_date.get(date, 0) + _manual_endurance_steps(entry)
+    manual_steps_on_stats_date = manual_steps_by_date.get(stats_date, 0)
+    if manual_steps_on_stats_date:
+        w["steps"]["value"] = (w["steps"].get("value") or 0) + manual_steps_on_stats_date
+        w["steps"]["manualEstimated"] = manual_steps_on_stats_date
     merged_garmin_ids = {str(entry.get("mergedGarminActivityId")) for entry in manual_entries if entry.get("source") == "merged"}
     acts = [row for row in acts if str(row.get("activityId")) not in merged_garmin_ids]
-    acts = sorted(acts + manual_activities, key=lambda row: row.get("start") or "", reverse=True)
+    acts = sorted(acts + manual_activities + manual_endurance, key=lambda row: row.get("start") or "", reverse=True)
     out["recent"] = acts[:12]
     strength_history = _strength_summary(limit=200)
     out["strength"] = {"activities": strength_history["activities"][:8]}
-    history = [row for row in _history_activities(client, today) if str(row.get("activityId")) not in merged_garmin_ids] + manual_activities
+    history = [row for row in _history_activities(client, today) if str(row.get("activityId")) not in merged_garmin_ids] + manual_activities + manual_endurance
     out["fitnessSeries"] = _training_history(history, today)
     muscle_start = today - datetime.timedelta(days=today.weekday(), weeks=11)
-    daily_steps = _call(client.get_daily_steps, muscle_start.isoformat(), ds) or daily_stats
+    daily_steps = list(_call(client.get_daily_steps, muscle_start.isoformat(), ds) or daily_stats)
+    daily_steps.extend({"calendarDate": date, "totalSteps": steps} for date, steps in manual_steps_by_date.items())
     out["muscleVolume"] = _muscle_volume_weeks(
         strength_history, history, daily_steps, daily_stats, today,
     )
@@ -2281,6 +2367,12 @@ def add_dashboard_routes(asgi_app, client):
     async def strength_exercises(_request):
         return JSONResponse({"exercises": _strength_exercise_catalog()})
 
+    async def create_manual_endurance_activity(request):
+        try:
+            return JSONResponse(_save_manual_endurance_activity("manual-endurance-" + uuid.uuid4().hex, await request.json()), status_code=201)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
     async def manual_strength_candidates(request):
         if client is None:
             return JSONResponse({"error": "garmin client not ready"}, status_code=503)
@@ -2338,6 +2430,7 @@ def add_dashboard_routes(asgi_app, client):
     asgi_app.router.routes.append(Route("/api/injury-measurements", injury_measurements, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/strength-activities/{activity_id:int}", strength_activity, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/strength-exercises", strength_exercises, methods=["GET"]))
+    asgi_app.router.routes.append(Route("/api/manual-endurance-activities", create_manual_endurance_activity, methods=["POST"]))
     asgi_app.router.routes.append(Route("/api/manual-strength-workouts", create_manual_strength_workout, methods=["POST"]))
     asgi_app.router.routes.append(Route("/api/manual-strength-workouts/{manual_id}", manual_strength_workout, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/manual-strength-workouts/{manual_id}/candidates", manual_strength_candidates, methods=["GET"]))
@@ -2480,7 +2573,7 @@ button.rf svg{width:15px;height:15px}
 .contrib-bar i{display:block;height:100%;border-radius:999px;background:var(--muted)}
 .contrib-bar i.optimal{background:var(--good)}.contrib-bar i.good{background:var(--accent)}.contrib-bar i.attention{background:var(--warn)}
 .contrib-note{display:block;margin-top:4px;font-size:11px;color:var(--faint)}
-.entry-actions{display:flex;justify-content:flex-end;margin-top:14px}.entry-form{display:none;margin-top:14px;padding:15px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2)}.entry-form.open{display:block}.entry-fields{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.injury-fields{grid-template-columns:repeat(3,1fr)}.entry-fields label{display:grid;gap:4px;font-size:12px;font-weight:700;color:var(--muted)}.entry-fields input{width:100%;border:1px solid var(--border);border-radius:9px;padding:9px;background:var(--surface);color:var(--text);font:inherit}.entry-submit{margin-top:12px;border:0;border-radius:999px;background:var(--accent);color:white;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer}.entry-status{margin:9px 0 0;font-size:12px;color:var(--muted)}.injurychart{width:100%;height:300px;display:block;margin-top:10px}.painlegend{display:flex;flex-wrap:wrap;gap:7px 14px;margin-top:12px;font-size:12px;color:var(--muted)}.painlegend span{display:flex;align-items:center;gap:5px}.painlegend i{width:9px;height:9px;border-radius:50%;display:inline-block}.pain-scale{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
+.entry-actions{display:flex;justify-content:flex-end;margin-top:14px}.entry-form{display:none;margin-top:14px;padding:15px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2)}.entry-form.open{display:block}.entry-fields{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.injury-fields{grid-template-columns:repeat(3,1fr)}.entry-fields label{display:grid;gap:4px;font-size:12px;font-weight:700;color:var(--muted)}.entry-fields input,.entry-fields select{width:100%;border:1px solid var(--border);border-radius:9px;padding:9px;background:var(--surface);color:var(--text);font:inherit}.entry-submit{margin-top:12px;border:0;border-radius:999px;background:var(--accent);color:white;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer}.entry-status{margin:9px 0 0;font-size:12px;color:var(--muted)}.injurychart{width:100%;height:300px;display:block;margin-top:10px}.painlegend{display:flex;flex-wrap:wrap;gap:7px 14px;margin-top:12px;font-size:12px;color:var(--muted)}.painlegend span{display:flex;align-items:center;gap:5px}.painlegend i{width:9px;height:9px;border-radius:50%;display:inline-block}.pain-scale{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
 @media(max-width:640px){.entry-fields,.injury-fields{grid-template-columns:1fr 1fr}.injurychart{height:240px}.primarychart{height:250px}.loadchart text,.effortdaily text{font-size:21px!important}}@media(max-width:420px){.entry-fields,.injury-fields{grid-template-columns:1fr}}
 .strength-open{display:inline-flex;align-items:center;margin-top:5px;border:0;background:transparent;color:var(--accent);padding:2px 0;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer}.strength-card-action{margin-top:12px;width:100%;justify-content:center!important;box-shadow:none!important;background:var(--surface-2)!important}
 .strength-modal[hidden]{display:none}.strength-modal{position:fixed;inset:0;z-index:50;background:rgba(5,12,22,.64);display:grid;place-items:center;padding:18px}.strength-dialog{width:min(720px,100%);max-height:calc(100dvh - 36px);display:flex;flex-direction:column;background:var(--bg);border:1px solid var(--border);border-radius:20px;box-shadow:0 24px 70px rgba(0,0,0,.35);overflow:hidden}.strength-dialog-head,.strength-dialog-foot{background:var(--surface);padding:14px 17px;display:flex;align-items:center;justify-content:space-between;gap:12px}.strength-dialog-head{border-bottom:1px solid var(--border)}.strength-dialog-head h2{font-size:18px;margin:0}.strength-dialog-head p{font-size:12px;color:var(--muted);margin:2px 0 0}.strength-dialog-foot{border-top:1px solid var(--border);justify-content:flex-end}.strength-dialog-body{padding:14px;overflow:auto;overscroll-behavior:contain}.strength-close{width:44px;height:44px;border:1px solid var(--border);border-radius:50%;background:var(--surface-2);color:var(--text);font-size:22px;cursor:pointer}.strength-save{border:0;border-radius:999px;background:var(--accent);color:#fff;padding:10px 16px;min-height:44px;font:inherit;font-weight:700;cursor:pointer}.strength-save:disabled{opacity:.65;cursor:wait}.strength-banner{padding:10px 12px;border-radius:11px;background:color-mix(in srgb,var(--accent) 12%,var(--surface));color:var(--muted);font-size:12.5px;margin-bottom:12px}.strength-banner.warn{background:color-mix(in srgb,var(--warn) 13%,var(--surface));color:var(--warn)}.strength-editor-title{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:17px 2px 8px}.strength-editor-title:first-child{margin-top:0}.strength-editor-title h3{margin:0;font-size:14px}.strength-editor-title p{margin:2px 0 0;font-size:11.5px;color:var(--muted)}.strength-set-list,.strength-manual-list{display:grid;gap:8px}.strength-set-row,.strength-manual-group{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:11px}.strength-set-meta,.strength-manual-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.strength-set-meta b,.strength-manual-head b{font-size:12.5px}.strength-set-meta span,.strength-manual-head span{font-size:11px;color:var(--muted)}.strength-fields{display:grid;grid-template-columns:minmax(170px,1fr) 78px 82px 92px;gap:8px;align-items:end}.strength-field{display:grid;gap:4px;min-width:0;color:var(--muted);font-size:11px;font-weight:700}.strength-field input{width:100%;min-width:0;border:1px solid var(--border);border-radius:9px;padding:9px;background:var(--surface-2);color:var(--text);font:inherit;font-size:16px}.strength-field input.changed{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 7%,var(--surface))}.strength-row-actions{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:8px}.strength-per-side{display:flex;align-items:center;gap:7px;min-height:36px;font-size:12px;color:var(--muted);cursor:pointer}.strength-per-side input{width:18px;height:18px}.strength-apply,.strength-add,.strength-remove,.strength-copy{border:1px solid var(--border);border-radius:999px;background:var(--surface-2);color:var(--text);padding:7px 10px;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer}.strength-add{min-height:40px}.strength-remove{border-color:transparent;background:transparent;color:var(--low)}.strength-original{font-size:11px;color:var(--faint);margin:6px 0 0}.strength-manual-sets{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.strength-manual-pair{min-width:0;padding:8px;border-radius:10px;background:var(--surface-2)}.strength-manual-set-head{display:flex;align-items:center;justify-content:space-between;gap:5px;margin-bottom:6px;font-size:11px}.strength-copy{padding:4px 7px;border-color:transparent;background:var(--surface);font-size:10px}.strength-manual-values{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.strength-manual-values .strength-field input{padding:8px 6px;background:var(--surface)}.strength-status{min-height:18px;margin:9px 2px 0;color:var(--muted);font-size:12px}.strength-empty{padding:18px;text-align:center;color:var(--muted);font-size:13px;background:var(--surface);border:1px dashed var(--border);border-radius:13px}.modal-open{overflow:hidden}
@@ -2578,6 +2671,15 @@ function openManualStrengthEditor(manualId){
   else fetch("/api/manual-strength-workouts/"+encodeURIComponent(manualId),{headers:{Authorization:"Bearer "+TOKEN}}).then(function(r){return r.json().then(function(b){if(!r.ok)throw new Error(b.error||"Could not load workout");return b;});}).then(done).catch(function(error){document.getElementById("strength-editor-content").innerHTML='<div class="strength-empty">'+esc(error.message)+'</div>';});
 }
 
+function openManualEnduranceEditor(defaultSport){
+  var modal=ensureStrengthModal();STRENGTH_STATE={mode:"endurance",payload:{sport:defaultSport||"run"}};STRENGTH_DIRTY=false;modal.hidden=false;document.body.classList.add("modal-open");
+  document.getElementById("strength-dialog-title").textContent="Manual activity";document.getElementById("strength-dialog-meta").textContent="Add a bike, run, or walk session";document.getElementById("strength-save").textContent="Save activity";
+  document.getElementById("strength-editor-content").innerHTML='<div class="strength-banner">Enter the values you know. “Estimate calories” uses your saved weight when available and a sport-specific walking, cycling, or running estimate.</div><div class="entry-fields"><label>Activity type<select id="manual-endurance-sport"><option value="bike" '+(defaultSport==="bike"?"selected":"")+'>Bike</option><option value="run" '+(defaultSport!=="bike"?"selected":"")+'>Run</option><option value="walk">Walk</option></select></label><label>Distance (km)<input id="manual-endurance-distance" type="number" min="0" step="0.01" required></label><label>Time (minutes)<input id="manual-endurance-minutes" type="number" min="1" step="1" required></label><label>Calories (kcal)<input id="manual-endurance-calories" type="number" min="0" step="1"></label></div><div class="entry-actions"><button type="button" class="rf" id="manual-endurance-estimate">Estimate calories</button></div><p class="strength-status" id="strength-status">Choose Run or Walk explicitly—the dashboard keeps them separate.</p>';
+  document.getElementById("manual-endurance-estimate").addEventListener("click",function(){var sport=document.getElementById("manual-endurance-sport").value,minutes=Number(document.getElementById("manual-endurance-minutes").value),weight=(((CURRENT_DASHBOARD||{}).wellness||{}).weight||{}).kg||70;if(!minutes||minutes<1){setStrengthStatus("Enter the time first",true);return;}var met={walk:3.5,bike:6,run:9.8}[sport],calories=Math.round(met*3.5*weight/200*minutes);document.getElementById("manual-endurance-calories").value=calories;setStrengthStatus("Estimated "+calories+" kcal for "+sport+" using "+weight+" kg. You can adjust it.");});
+}
+
+function saveManualEnduranceDetails(){var button=document.getElementById("strength-save"),sport=document.getElementById("manual-endurance-sport").value,distance=readStrengthNumber(document.getElementById("manual-endurance-distance"),"Distance"),minutes=readStrengthNumber(document.getElementById("manual-endurance-minutes"),"Time"),calories=readStrengthNumber(document.getElementById("manual-endurance-calories"),"Calories");if(distance==null||minutes==null||minutes<1){setStrengthStatus("Distance and time are required",true);return;}button.disabled=true;fetch("/api/manual-endurance-activities",{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({sport:sport,distanceKm:distance,minutes:minutes,calories:calories,weightKg:((((CURRENT_DASHBOARD||{}).wellness||{}).weight||{}).kg||70),activityStart:new Date().toISOString()})}).then(function(r){return r.json().then(function(b){if(!r.ok)throw new Error(b.error||"Could not save activity");return b;});}).then(function(){setStrengthStatus("Saved. Refreshing dashboard…");setTimeout(function(){var modal=document.getElementById("strength-modal");modal.hidden=true;document.body.classList.remove("modal-open");load();},350);}).catch(function(error){setStrengthStatus(error.message,true);}).finally(function(){button.disabled=false;button.textContent="Save activity";});}
+
 function loadManualMergeCandidates(){var id=(STRENGTH_STATE.payload||{}).manualId,target=document.getElementById("manual-merge-candidates");if(!id||!target)return;target.innerHTML='<div class="strength-empty">Looking for recent Garmin strength workouts…</div>';fetch("/api/manual-strength-workouts/"+encodeURIComponent(id)+"/candidates",{headers:{Authorization:"Bearer "+TOKEN}}).then(function(r){return r.json().then(function(b){if(!r.ok)throw new Error(b.error||"Could not load candidates");return b;});}).then(function(data){var rows=data.candidates||[];target.innerHTML=rows.length?rows.map(function(row){return '<div class="strength-set-row"><div class="strength-set-meta"><div><b>'+esc(row.name)+'</b><span>'+esc((row.start||"").replace("T"," "))+'</span></div><button type="button" class="strength-apply" data-manual-merge="'+esc(row.activityId)+'">Merge</button></div><p class="strength-original">Garmin: '+n(row.totalSets)+' sets · '+n(row.cal)+' kcal. Garmin numbers will replace matched set values.</p></div>';}).join(""):'<div class="strength-empty">No Garmin strength workout was found within 24 hours.</div>';}).catch(function(error){target.innerHTML='<div class="strength-empty">'+esc(error.message)+'</div>';});}
 function mergeManualStrengthWorkout(garminActivityId){var id=(STRENGTH_STATE.payload||{}).manualId;if(!id||!window.confirm("Merge this manual workout with the selected Garmin workout? Your original manual sets will be retained."))return;fetch("/api/manual-strength-workouts/"+encodeURIComponent(id)+"/merge",{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({garminActivityId:garminActivityId})}).then(function(r){return r.json().then(function(b){if(!r.ok)throw new Error(b.error||"Could not merge");return b;});}).then(function(){setStrengthStatus("Merged. Refreshing dashboard…");setTimeout(function(){closeStrengthEditor();load();},350);}).catch(function(error){setStrengthStatus(error.message,true);});}
 
@@ -2619,6 +2721,7 @@ function addManualStrengthGroup(){
 }
 
 function saveStrengthDetails(){
+  if(STRENGTH_STATE&&STRENGTH_STATE.mode==="endurance"){saveManualEnduranceDetails();return;}
   var button=document.getElementById("strength-save"),sets;try{sets=collectStrengthSets();}catch(error){setStrengthStatus(error.message,true);return;}button.disabled=true;button.textContent="Saving…";setStrengthStatus("Saving details…");var activity=STRENGTH_STATE.activity||{};
   var manual=STRENGTH_STATE.mode==="manual",payload={activityName:manual?document.getElementById("manual-workout-name").value.trim():activity.name,activityStart:manual?(STRENGTH_STATE.payload.activityStart||new Date().toISOString()):activity.start,sets:sets},endpoint=manual?(STRENGTH_STATE.payload.manualId?"/api/manual-strength-workouts/"+encodeURIComponent(STRENGTH_STATE.payload.manualId):"/api/manual-strength-workouts"):"/api/strength-activities/"+encodeURIComponent(activity.activityId);
   fetch(endpoint,{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify(payload)})
@@ -2677,9 +2780,10 @@ function SPORT(meta,d){
   var c=el("div","card sport "+meta.key);
   var head='<div class="top"><span class="ico">'+meta.emoji+'</span><div><h3>'+meta.name+
     '</h3><div class="d">'+meta.tag+'</div></div></div>';
+  var action=(meta.key==="bike"||meta.key==="run")?'<button type="button" class="rf strength-card-action" data-manual-endurance-new="'+meta.key+'">Log '+(meta.key==="bike"?"bike":"run / walk")+'</button>':'';
   if(!s.hasData){
     c.innerHTML=head+'<div class="empty"><span class="pill mute">Ready</span>'+
-      '<span class="msg">No '+meta.name.toLowerCase()+' sessions yet — they\'ll show here automatically once you log one on your Garmin.</span></div>';
+      '<span class="msg">No '+meta.name.toLowerCase()+' sessions yet — they\'ll show here automatically once you log one on your Garmin.</span></div>'+action;
     return c;
   }
   var wk=s.week||{},mo=s.month||{},last=s.last||{};
@@ -2690,7 +2794,7 @@ function SPORT(meta,d){
       '<div class="t"><div class="n">'+n(mo.km)+'</div><div class="l">km · 30d</div></div>'+
     '</div>'+
     '<div class="last">Last: <b>'+n(last.km)+' km</b> in '+n(last.min)+' min'+
-      (last.hr?' · '+last.hr+' bpm':'')+' <span style="color:var(--faint)">('+(last.date||"")+')</span></div>';
+      (last.hr?' · '+last.hr+' bpm':'')+' <span style="color:var(--faint)">('+(last.date||"")+')</span></div>'+action;
   return c;
 }
 
@@ -2991,7 +3095,7 @@ function render(d){
       '<div class="c" data-k="Dist"><b>'+n(a.km)+'</b> km</div>'+
       '<div class="c" data-k="Time"><b>'+n(a.min)+'</b> min</div>'+
       '<div class="c hidesm" data-k="HR"><b>'+n(a.hr)+'</b> bpm</div>'+
-      '<div class="c" data-k="Cal"><b>'+n(a.cal)+'</b> kcal</div>';
+      '<div class="c" data-k="Cal"><b>'+n(a.cal)+'</b> kcal'+(a.caloriesEstimated?'<small>estimated</small>':'')+'</div>';
     acts.appendChild(r);
   });
   if(!(d.recent||[]).length) acts.appendChild(el("div","act",'<span style="color:var(--muted)">No recent activities.</span>'));
@@ -3020,6 +3124,7 @@ function render(d){
   document.querySelectorAll("[data-strength-id]").forEach(function(button){button.addEventListener("click",function(){openStrengthEditor(button.dataset.strengthId);});});
   document.querySelectorAll("[data-manual-strength-new]").forEach(function(button){button.addEventListener("click",function(){openManualStrengthEditor();});});
   document.querySelectorAll("[data-manual-strength-id]").forEach(function(button){button.addEventListener("click",function(){openManualStrengthEditor(button.dataset.manualStrengthId);});});
+  document.querySelectorAll("[data-manual-endurance-new]").forEach(function(button){button.addEventListener("click",function(){openManualEnduranceEditor(button.dataset.manualEnduranceNew);});});
   document.getElementById("body-entry").addEventListener("submit",function(event){event.preventDefault();var data={timestamp:new Date().toISOString()};new FormData(event.target).forEach(function(value,key){data[key]=value;});var status=document.getElementById("body-entry-status");status.textContent="Saving…";fetch("/api/body-measurements",{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify(data)}).then(function(r){return r.json().then(function(body){if(!r.ok)throw new Error(body.error||"Could not save measurement");return body;});}).then(function(){status.textContent="Saved. Refreshing dashboard…";load();}).catch(function(error){status.textContent=error.message;});});
   document.getElementById("injury-entry").addEventListener("submit",function(event){event.preventDefault();saveEntry("/api/injury-measurements","injury-entry","injury-entry-status");});
 }

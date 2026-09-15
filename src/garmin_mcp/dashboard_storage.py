@@ -82,6 +82,17 @@ class DashboardDatabase:
                     )
                 """)
                 cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS dashboard_manual_endurance_activities (
+                        manual_id TEXT PRIMARY KEY,
+                        sport TEXT NOT NULL CHECK (sport IN ('bike', 'run', 'walk')),
+                        activity_name TEXT NOT NULL,
+                        activity_start TIMESTAMPTZ NOT NULL,
+                        payload JSONB NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS dashboard_data_migrations (
                         migration_key TEXT PRIMARY KEY,
                         completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -272,6 +283,24 @@ class DashboardDatabase:
                     updated_at = NOW()
             """, (manual_id, entry.get("activityName"), entry.get("activityStart"),
                    json.dumps(entry), entry.get("mergedGarminActivityId")))
+
+    def manual_endurance_activities(self):
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT manual_id, payload FROM dashboard_manual_endurance_activities ORDER BY activity_start DESC")
+            return {manual_id: dict(payload or {}, manualId=manual_id) for manual_id, payload in cursor.fetchall()}
+
+    def save_manual_endurance_activity(self, manual_id, entry):
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO dashboard_manual_endurance_activities
+                    (manual_id, sport, activity_name, activity_start, payload, updated_at)
+                VALUES (%s, %s, %s, %s, %s::jsonb, NOW())
+                ON CONFLICT (manual_id) DO UPDATE SET
+                    sport = EXCLUDED.sport, activity_name = EXCLUDED.activity_name,
+                    activity_start = EXCLUDED.activity_start, payload = EXCLUDED.payload, updated_at = NOW()
+            """, (manual_id, entry.get("sport"), entry.get("activityName"), entry.get("activityStart"), json.dumps(entry)))
 
 
 def database(body_path=None, injury_path=None, strength_path=None):
