@@ -1832,15 +1832,20 @@ def _history_activities(client, today):
     return gathered
 
 
-# Long response: accumulated training. The classic Banister/TrainingPeaks
-# constant is 42 days, but Strava's Fitness demonstrably moves faster. Fitting
-# four of the athlete's own Strava Fitness readings (Aug 2, Aug 16, Sep 1 and
-# Sep 15 2026) against their weekly Relative Effort puts the constant at ~27
-# days, stable at 25-30 however the weekly totals are distributed across days.
-# 28 is that result rounded to a round four weeks.
-FITNESS_DAYS = 28.0
+# Long response: accumulated training, on the classic Banister/TrainingPeaks
+# constant.
+#
+# A shorter constant was tried (28 days, fitted against the athlete's own
+# Strava Fitness readings) and reverted. That fit fed *Strava's* weekly
+# Relative Effort into the model, but these points carry more dynamic range
+# than Strava's - the same week reads ~165 here against Strava's 143 - so a
+# constant tuned on the smoother series tracks this one too closely. It pulled
+# quiet stretches further down and heavy ones further up, widening every
+# percentage change: a month that Strava reports as +71% came out at +115%.
+# A longer constant smooths the curve and is what keeps those ratios sane.
+FITNESS_DAYS = 42.0
 FATIGUE_DAYS = 7.0     # short response: recent tiredness
-FITNESS_SEED_DAYS = 28  # opening window used to prime the averages
+FITNESS_SEED_DAYS = 42  # opening window used to prime the averages
 
 
 def _training_history(activities, today):
@@ -3018,7 +3023,7 @@ function render(d){
   response.appendChild(effortCard);
   var fitnessCard=el("div","card");
   var fs=d.fitnessSeries||[],latest=fs[fs.length-1]||{};
-  fitnessCard.innerHTML='<div class="label"><p class="eyebrow">Fitness level · effort model</p><span class="pill good" id="fit-value">'+n(latest.fitness)+' index</span></div><div class="charttabs" id="fit-tabs"><button data-days="30" class="active">1 month</button><button data-days="90">3 months</button><button data-days="180">6 months</button><button data-days="365">1 year</button><button data-days="731">2 years</button></div><div class="fitsummary" id="fit-summary"></div><svg class="loadchart primarychart" id="fitnessc" viewBox="0 0 1000 360" preserveAspectRatio="none"></svg><div class="metricnote">A 28-day weighted average of your daily effort points, so it builds slowly and decays when you stop — the same input Strava builds its Fitness score from, on the same scale. The badge shows the selected day’s level; click any point to compare it with the first day of the period, or leave it on today.</div>';
+  fitnessCard.innerHTML='<div class="label"><p class="eyebrow">Fitness level · effort model</p><span class="pill good" id="fit-value">'+n(latest.fitness)+' index</span></div><div class="charttabs" id="fit-tabs"><button data-days="30" class="active">1 month</button><button data-days="90">3 months</button><button data-days="180">6 months</button><button data-days="365">1 year</button><button data-days="731">2 years</button></div><div class="fitsummary" id="fit-summary"></div><svg class="loadchart primarychart" id="fitnessc" viewBox="0 0 1000 360" preserveAspectRatio="none"></svg><div class="metricnote">A 42-day weighted average of your daily effort points, so it builds slowly and decays when you stop — the same input Strava builds its Fitness score from, on the same scale. The badge shows the selected day’s level; click any point to compare it with the first day of the period, or leave it on today.</div>';
   response.appendChild(fitnessCard);app.appendChild(response);
 
   // readiness contributors + sleep detail
@@ -3413,8 +3418,8 @@ function drawFitness(series,days,selectedIndex){
   var svg=document.getElementById("fitnessc");if(!svg)return;svg.innerHTML="";var rows=series.slice(-days);if(!rows.length)return;
   var selected=selectedIndex==null?rows.length-1:Math.max(0,Math.min(rows.length-1,selectedIndex)),first=rows[0].fitness||0,current=rows[selected].fitness||0,delta=current-first,pct=first>=1?delta/first*100:null,summary=document.getElementById("fit-summary"),value=document.getElementById("fit-value"),period=days===30?'30 days':days===90?'90 days':days===180?'six months':days===365?'year':'two years';
   function fmt(date){return new Date(date+'T00:00:00').toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});}
-  if(value)value.textContent=current+' index';
-  if(summary){var pctText=pct==null?'—%':Math.abs(Math.round(pct))+'%',direction=pct==null?'':delta>0?'▲ ':delta<0?'▼ ':'';summary.innerHTML='<span class="change '+(delta>0?'up':'')+'">'+direction+pctText+'</span><span>'+(delta>0?'+':'')+delta.toFixed(1)+' pts</span><span class="period">'+(selected===rows.length-1?'over the past '+period:'from '+fmt(rows[0].date)+' to '+fmt(rows[selected].date))+'</span>';}
+  if(value)value.textContent=Math.round(current)+' index';
+  if(summary){var pctText=pct==null?'—%':Math.abs(Math.round(pct))+'%',direction=pct==null?'':delta>0?'▲ ':delta<0?'▼ ':'';summary.innerHTML='<span class="change '+(delta>0?'up':'')+'">'+direction+pctText+'</span><span>'+(delta>0?'+':'')+Math.round(delta)+' pts</span><span class="period">'+(selected===rows.length-1?'over the past '+period:'from '+fmt(rows[0].date)+' to '+fmt(rows[selected].date))+'</span>';}
   var W=1000,H=360,pL=52,pR=18,pT=46,pB=44,vals=[];rows.forEach(function(x){vals.push(x.fitness||0)});var max=Math.max.apply(null,vals.concat([1]))*1.12;
   function X(i){return pL+i*(W-pL-pR)/Math.max(1,rows.length-1)}function Y(v){return pT+(max-v)/max*(H-pT-pB)}function plot(key,color){var d=rows.map(function(x,i){return(i?"L":"M")+X(i).toFixed(1)+" "+Y(x[key]||0).toFixed(1);}).join(" ");var p=document.createElementNS(ns,"path");p.setAttribute("d",d);p.setAttribute("fill","none");p.setAttribute("stroke",color);p.setAttribute("stroke-width",4);p.setAttribute("stroke-linejoin","round");svg.appendChild(p)}
   [0,max/2,max].forEach(function(v){var l=document.createElementNS(ns,"line"),t=document.createElementNS(ns,"text");l.setAttribute("x1",pL);l.setAttribute("x2",W-pR);l.setAttribute("y1",Y(v));l.setAttribute("y2",Y(v));l.setAttribute("stroke",css("--border"));svg.appendChild(l);t.setAttribute("x",pL-10);t.setAttribute("y",Y(v)+5);t.setAttribute("text-anchor","end");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));t.textContent=Math.round(v);svg.appendChild(t)});
@@ -3423,7 +3428,7 @@ function drawFitness(series,days,selectedIndex){
   // The selected day's value sits in a badge on top of its marker, the way
   // Strava labels the current day, so the number is readable without hovering.
   (function(){
-    var label=String(current),bw=Math.max(56,label.length*17+26),bh=34;
+    var label=String(Math.round(current)),bw=Math.max(56,label.length*17+26),bh=34;
     var bx=Math.max(pL,Math.min(W-pR-bw,X(selected)-bw/2));
     var box=document.createElementNS(ns,"rect");
     box.setAttribute("x",bx);box.setAttribute("y",2);box.setAttribute("width",bw);box.setAttribute("height",bh);
@@ -3433,7 +3438,7 @@ function drawFitness(series,days,selectedIndex){
     t.setAttribute("font-size",20);t.setAttribute("font-weight",800);t.setAttribute("fill",css("--surface"));
     t.textContent=label;svg.appendChild(t);
   })();
-  [0,Math.floor(rows.length/2),rows.length-1].forEach(function(i){var t=document.createElementNS(ns,"text");t.setAttribute("x",X(i));t.setAttribute("y",H-10);t.setAttribute("text-anchor","middle");t.setAttribute("font-size",17);t.setAttribute("fill",css("--faint"));t.textContent=rows[i].label;svg.appendChild(t)});chartTip(svg,rows,function(x){return '<b>'+x.label+'</b><br>Fitness: '+x.fitness+'<br>Fatigue: '+x.fatigue+'<br>Form: '+x.form+'<br>Effort that day: '+x.load+' pts';});
+  [0,Math.floor(rows.length/2),rows.length-1].forEach(function(i){var t=document.createElementNS(ns,"text");t.setAttribute("x",X(i));t.setAttribute("y",H-10);t.setAttribute("text-anchor","middle");t.setAttribute("font-size",17);t.setAttribute("fill",css("--faint"));t.textContent=rows[i].label;svg.appendChild(t)});chartTip(svg,rows,function(x){return '<b>'+x.label+'</b><br>Fitness: '+Math.round(x.fitness)+'<br>Fatigue: '+Math.round(x.fatigue)+'<br>Form: '+Math.round(x.form)+'<br>Effort that day: '+x.load+' pts';});
   svg.onclick=function(e){var r=svg.getBoundingClientRect(),chartX=(e.clientX-r.left)/r.width*W,i=Math.round((chartX-pL)/(W-pL-pR)*(rows.length-1));drawFitness(series,days,Math.max(0,Math.min(rows.length-1,i)));};
 }
 

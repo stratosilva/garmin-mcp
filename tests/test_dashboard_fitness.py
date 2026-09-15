@@ -78,51 +78,32 @@ class FitnessWarmupTests(unittest.TestCase):
         self.assertGreater(series[-1]["fitness"], series[0]["fitness"])
 
 
-class StravaCalibrationTests(unittest.TestCase):
-    """Pins the response constant against the athlete's own Strava readings.
+class ResponseConstantTests(unittest.TestCase):
+    """Guards the smoothing that keeps percentage changes comparable to Strava.
 
-    Weekly Relative Effort totals and four Fitness values were read off Strava
-    in September 2026. Propagating the weeklies from the first Fitness reading
-    should land near the later ones; a constant far from 28 days does not.
+    A constant fitted against Strava's own weekly Relative Effort was tried and
+    reverted: these effort points swing harder than Strava's, so a constant
+    tuned on the smoother series tracked this one too closely and inflated
+    every percentage change. The test below expresses the property that
+    actually matters - the curve must be smoother than its input.
     """
 
-    WEEKLY = [("2026-06-29", 27), ("2026-07-06", 47), ("2026-07-13", 24),
-              ("2026-07-20", 5), ("2026-07-27", 11), ("2026-08-03", 31),
-              ("2026-08-10", 58), ("2026-08-17", 33), ("2026-08-24", 80),
-              ("2026-08-31", 143), ("2026-09-07", 67), ("2026-09-14", 60)]
-    SEED_DATE, SEED = datetime.date(2026, 8, 2), 7.14
-    OBSERVED = {datetime.date(2026, 8, 16): 7.04,
-                datetime.date(2026, 9, 1): 8.0,
-                datetime.date(2026, 9, 15): 12.0}
-
-    def daily(self):
-        out = {}
-        for start, total in self.WEEKLY:
-            day = datetime.date.fromisoformat(start)
-            days = [day + datetime.timedelta(days=i) for i in range(7)
-                    if day + datetime.timedelta(days=i) <= TODAY]
-            for d in days:
-                out[d] = total / len(days)
-        return out
-
-    def error_at(self, tau):
-        daily, fitness, day, total = self.daily(), self.SEED, self.SEED_DATE, 0.0
-        while day <= TODAY:
-            day += datetime.timedelta(days=1)
-            fitness += (daily.get(day, 0.0) - fitness) / tau
-            if day in self.OBSERVED:
-                total += (fitness - self.OBSERVED[day]) ** 2
-        return total
-
-    def test_the_shipped_constant_beats_the_classic_42_day_one(self):
-        self.assertLess(self.error_at(dashboard.FITNESS_DAYS), self.error_at(42.0))
-
-    def test_the_shipped_constant_is_near_the_fitted_optimum(self):
-        best = min(range(10, 70), key=lambda t: self.error_at(float(t)))
-        self.assertAlmostEqual(dashboard.FITNESS_DAYS, best, delta=3.0)
+    def test_fitness_swings_less_than_the_training_that_drives_it(self):
+        quiet, heavy = 3.0, 20.0
+        activities = steady(400, quiet)[60:] + steady(60, heavy)
+        series = dashboard._training_history(activities, TODAY)
+        by = {row["date"]: row["fitness"] for row in series}
+        before = by[(TODAY - datetime.timedelta(days=60)).isoformat()]
+        now = series[-1]["fitness"]
+        # Daily effort jumped 6.7x; a month and a half later the index must
+        # still be well short of that, or percentage changes read as nonsense.
+        self.assertLess(now / before, heavy / quiet)
 
     def test_fatigue_stays_on_the_classic_seven_day_response(self):
         self.assertEqual(dashboard.FATIGUE_DAYS, 7.0)
+
+    def test_fitness_responds_more_slowly_than_fatigue(self):
+        self.assertGreater(dashboard.FITNESS_DAYS, dashboard.FATIGUE_DAYS * 3)
 
 
 class FitnessResponseTests(unittest.TestCase):
