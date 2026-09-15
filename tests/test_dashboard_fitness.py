@@ -78,6 +78,53 @@ class FitnessWarmupTests(unittest.TestCase):
         self.assertGreater(series[-1]["fitness"], series[0]["fitness"])
 
 
+class StravaCalibrationTests(unittest.TestCase):
+    """Pins the response constant against the athlete's own Strava readings.
+
+    Weekly Relative Effort totals and four Fitness values were read off Strava
+    in September 2026. Propagating the weeklies from the first Fitness reading
+    should land near the later ones; a constant far from 28 days does not.
+    """
+
+    WEEKLY = [("2026-06-29", 27), ("2026-07-06", 47), ("2026-07-13", 24),
+              ("2026-07-20", 5), ("2026-07-27", 11), ("2026-08-03", 31),
+              ("2026-08-10", 58), ("2026-08-17", 33), ("2026-08-24", 80),
+              ("2026-08-31", 143), ("2026-09-07", 67), ("2026-09-14", 60)]
+    SEED_DATE, SEED = datetime.date(2026, 8, 2), 7.14
+    OBSERVED = {datetime.date(2026, 8, 16): 7.04,
+                datetime.date(2026, 9, 1): 8.0,
+                datetime.date(2026, 9, 15): 12.0}
+
+    def daily(self):
+        out = {}
+        for start, total in self.WEEKLY:
+            day = datetime.date.fromisoformat(start)
+            days = [day + datetime.timedelta(days=i) for i in range(7)
+                    if day + datetime.timedelta(days=i) <= TODAY]
+            for d in days:
+                out[d] = total / len(days)
+        return out
+
+    def error_at(self, tau):
+        daily, fitness, day, total = self.daily(), self.SEED, self.SEED_DATE, 0.0
+        while day <= TODAY:
+            day += datetime.timedelta(days=1)
+            fitness += (daily.get(day, 0.0) - fitness) / tau
+            if day in self.OBSERVED:
+                total += (fitness - self.OBSERVED[day]) ** 2
+        return total
+
+    def test_the_shipped_constant_beats_the_classic_42_day_one(self):
+        self.assertLess(self.error_at(dashboard.FITNESS_DAYS), self.error_at(42.0))
+
+    def test_the_shipped_constant_is_near_the_fitted_optimum(self):
+        best = min(range(10, 70), key=lambda t: self.error_at(float(t)))
+        self.assertAlmostEqual(dashboard.FITNESS_DAYS, best, delta=3.0)
+
+    def test_fatigue_stays_on_the_classic_seven_day_response(self):
+        self.assertEqual(dashboard.FATIGUE_DAYS, 7.0)
+
+
 class FitnessResponseTests(unittest.TestCase):
     def test_fatigue_responds_faster_than_fitness(self):
         activities = steady(800, 4.0)[20:] + steady(20, 40.0)
@@ -92,7 +139,7 @@ class FitnessResponseTests(unittest.TestCase):
 
     def test_fitness_decays_when_training_stops(self):
         series = dashboard._training_history(steady(800, 10.0)[60:], TODAY)
-        self.assertLess(series[-1]["fitness"], 4.0)     # 60 idle days, 42-day constant
+        self.assertLess(series[-1]["fitness"], 4.0)     # 60 idle days, 28-day constant
         self.assertGreater(series[-1]["fitness"], 0.0)  # but has not hit zero
 
     def test_two_year_window_is_returned(self):
