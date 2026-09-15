@@ -157,37 +157,40 @@ class ResponseConstantTests(unittest.TestCase):
     def test_fitness_responds_more_slowly_than_fatigue(self):
         self.assertGreater(dashboard.FITNESS_DAYS, dashboard.FATIGUE_DAYS * 3)
 
-    def test_thirty_day_change_stays_close_to_what_strava_reports(self):
-        """Percentages are the point of this constant, so pin them.
+    def test_scale_changes_points_without_changing_percentages(self):
+        from unittest.mock import patch
+        activities = steady(400, 4.0)[30:] + steady(30, 15.0)
+        scaled = dashboard._training_history(activities, TODAY)
+        with patch.object(dashboard, "FITNESS_SCALE", 1.0):
+            unscaled = dashboard._training_history(activities, TODAY)
+        for index in (-1, -32):
+            self.assertAlmostEqual(scaled[index]["fitness"], unscaled[index]["fitness"] * 1.2, places=5)
+        self.assertAlmostEqual(scaled[-1]["fitness"] / scaled[-32]["fitness"],
+                               unscaled[-1]["fitness"] / unscaled[-32]["fitness"], places=5)
 
-        These are the dashboard's own weekly effort totals for Jun-Sep 2026,
-        alongside the +71% Strava reported over the same 30 days. The constant
-        controls how much the curve is smoothed, and therefore the size of that
-        ratio; at 28 days the same inputs produced +112%.
-        """
-        weekly = [("2026-06-29", 33.8), ("2026-07-06", 54.4), ("2026-07-13", 26.2),
-                  ("2026-07-20", 13.4), ("2026-07-27", 15.0), ("2026-08-03", 27.4),
-                  ("2026-08-10", 59.7), ("2026-08-17", 32.5), ("2026-08-24", 85.5),
-                  ("2026-08-31", 151.6), ("2026-09-07", 67.8), ("2026-09-14", 62.8)]
-        first = datetime.date(2026, 6, 29)
-        warm = 8.0          # daily effort before the window, matched to the live chart
-        daily = {}
-        for start, total in weekly:
-            day = datetime.date.fromisoformat(start)
-            days = [day + datetime.timedelta(days=i) for i in range(7)
-                    if day + datetime.timedelta(days=i) <= TODAY]
-            for d in days:
-                daily[d] = total / len(days)
+    def test_calibration_preserves_relative_effort_and_fatigue(self):
+        from unittest.mock import patch
+        import copy
+        activities = steady(400, 10.0)
+        for row in activities:
+            row["hr"] = 160.0
+        original = copy.deepcopy(activities)
+        calibrated = dashboard._training_history(activities, TODAY)
+        with patch.object(dashboard, "_fitness_effort", side_effect=lambda activity, effort: effort):
+            baseline = dashboard._training_history(activities, TODAY)
+        self.assertEqual(activities, original)
+        for before, after in zip(baseline, calibrated):
+            for key in ("effort", "load", "garminLoad", "fatigue"):
+                self.assertEqual(before[key], after[key])
+        self.assertGreater(calibrated[-1]["fitness"], baseline[-1]["fitness"])
 
-        fitness, day, month_ago = warm, first - datetime.timedelta(days=240), None
-        while day < TODAY:
-            day += datetime.timedelta(days=1)
-            load = daily.get(day, warm if day < first else 0.0)
-            fitness += (load - fitness) / dashboard.FITNESS_DAYS
-            if day == TODAY - datetime.timedelta(days=30):
-                month_ago = fitness
-        percent = (fitness / month_ago - 1) * 100
-        self.assertAlmostEqual(percent, 71.0, delta=15.0)
+    def test_intensity_adjustment_preserves_zone_based_input(self):
+        easy = dashboard._fitness_effort({"hr": 139}, 25.7)
+        hard = dashboard._fitness_effort({"hr": 161}, 185.6)
+        self.assertAlmostEqual(easy, 33.815, delta=0.01)
+        self.assertAlmostEqual(hard, 379.365, delta=0.1)
+        self.assertAlmostEqual(dashboard._fitness_effort({"hr": 139}, 51.4), easy * 2)
+
 
 
 class FitnessResponseTests(unittest.TestCase):
@@ -204,7 +207,7 @@ class FitnessResponseTests(unittest.TestCase):
 
     def test_fitness_decays_when_training_stops(self):
         series = dashboard._training_history(steady(800, 10.0)[60:], TODAY)
-        self.assertLess(series[-1]["fitness"], 4.0)     # 60 idle days, 28-day constant
+        self.assertLess(series[-1]["fitness"], 4.0)     # 60 idle days, 42-day constant
         self.assertGreater(series[-1]["fitness"], 0.0)  # but has not hit zero
 
     def test_two_year_window_is_returned(self):

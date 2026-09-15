@@ -1837,7 +1837,7 @@ def _agg(items):
 # two-year point (it moved the two-year change from +31% to +16%); going
 # further changed nothing.
 HISTORY_DAYS = 1100
-VISIBLE_DAYS = 730
+VISIBLE_DAYS = 731  # enough for two calendar years spanning a leap day
 
 # Enough pages to reach that far even at several activities a day. Only a
 # safety stop: the loop normally exits as soon as it passes the cutoff.
@@ -1879,30 +1879,36 @@ def _history_activities(client, today):
     return gathered
 
 
-# Long response: accumulated training, on the classic Banister/TrainingPeaks
-# constant.
-#
-# A shorter constant was tried (28 days, fitted against the athlete's own
-# Strava Fitness readings) and reverted. That fit fed *Strava's* weekly
-# Relative Effort into the model, but these points carry more dynamic range
-# than Strava's - the same week reads ~165 here against Strava's 143 - so a
-# constant tuned on the smoother series tracks this one too closely. It pulled
-# quiet stretches further down and heavy ones further up, widening every
-# percentage change: a month that Strava reports as +71% came out at +115%.
-# A longer constant smooths the curve and is what keeps those ratios sane.
+# Fitness-only calibration from paired activity/weekly Strava readings (Sep 2026).
+# These are empirical coefficients, not Strava's published formula. Preserve
+# the existing Relative Effort scores and capacity band; only Fitness receives
+# this intensity adjustment and the agreed 20% scale increase.
 FITNESS_DAYS = 42.0
-FATIGUE_DAYS = 7.0     # short response: recent tiredness
-FITNESS_SEED_DAYS = 42  # opening window used to prime the averages
+FATIGUE_DAYS = 7.0
+FITNESS_SEED_DAYS = 42
+FITNESS_BASE_WEIGHT = 0.8481948641500818
+FITNESS_INTENSITY_WEIGHT = 0.8276011107352337
+FITNESS_SCALE = 1.2
+
+
+def _fitness_effort(activity, effort):
+    """Calibrate existing zone-based effort for Fitness without mutating it.
+
+    Average HR modulates the existing effort; it does not replace recorded
+    zone durations. Missing HR gets the baseline weight. The coefficients
+    were fitted to 12 weekly totals and two hard runs, with a recent run held
+    out. This remains an approximation, especially for intervals.
+    """
+    hr = _num(activity.get("hr"))
+    intensity = max(0.0, ((hr if hr is not None else 130.0) - 130.0) / 30.0)
+    return effort * (FITNESS_BASE_WEIGHT + FITNESS_INTENSITY_WEIGHT * intensity) * FITNESS_SCALE
 
 
 def _training_history(activities, today):
-    """Build the Fitness/Fatigue series from Strava-comparable effort points.
+    """Build calibrated Fitness alongside unchanged daily Relative Effort.
 
-    Fitness is an exponentially weighted average of daily Relative Effort, the
-    same input Strava documents for its Fitness score. It deliberately does not
-    use Garmin's EPOC-based Training Load: that runs on a different scale (a
-    little over twice these points), so mixing the two shifted both the index
-    and every percentage change quoted against it.
+    Fatigue retains its existing seven-day effort average. Form is the
+    difference between the displayed Fitness and Fatigue values.
     """
     daily = {}
     for activity in activities:
@@ -1912,35 +1918,38 @@ def _training_history(activities, today):
             continue
         if date > today or (today - date).days > HISTORY_DAYS:
             continue
-        entry = daily.setdefault(date, {"garminLoad": 0.0, "effort": 0.0})
+        entry = daily.setdefault(date, {"garminLoad": 0.0, "effort": 0.0, "fitnessEffort": 0.0})
         garmin_load = activity.get("load") or 0
         entry["garminLoad"] += garmin_load
-        entry["effort"] += activity.get("effort") or round(garmin_load / 3.0, 1)
+        effort = activity.get("effort") or round(garmin_load / 3.0, 1)
+        entry["effort"] += effort
+        entry["fitnessEffort"] += _fitness_effort(activity, effort)
     start = max(min(daily) if daily else today, today - datetime.timedelta(days=HISTORY_DAYS))
     span = (today - start).days + 1
 
-    def effort_on(offset):
-        return (daily.get(start + datetime.timedelta(days=offset), {}) or {}).get("effort") or 0.0
+    def effort_on(offset, key="effort"):
+        return (daily.get(start + datetime.timedelta(days=offset), {}) or {}).get(key) or 0.0
 
     # Seed both averages with the opening weeks' mean daily effort. Starting
     # from zero would leave the oldest visible points still climbing out of the
     # warm-up, which understated them and inflated every long-period gain.
     seed_days = min(FITNESS_SEED_DAYS, span)
     seed = sum(effort_on(offset) for offset in range(seed_days)) / seed_days if seed_days else 0.0
-    fitness = fatigue = seed
+    fatigue = seed
+    fitness = sum(effort_on(offset, "fitnessEffort") for offset in range(seed_days)) / seed_days if seed_days else 0.0
     series = []
     for offset in range(span):
         date = start + datetime.timedelta(days=offset)
         entry = daily.get(date, {})
         load = entry.get("effort") or 0.0
-        fitness += (load - fitness) / FITNESS_DAYS
+        fitness += ((entry.get("fitnessEffort") or 0.0) - fitness) / FITNESS_DAYS
         fatigue += (load - fatigue) / FATIGUE_DAYS
         # "%b %-d" is a POSIX-only directive that raises on Windows, so the day
         # number is interpolated directly to keep the module importable there.
         series.append({"date": date.isoformat(), "label": f"{date:%b} {date.day}",
                        "load": round(load, 1), "effort": round(load, 1),
                        "garminLoad": round(entry.get("garminLoad") or 0, 1),
-                       "fitness": round(fitness, 1), "fatigue": round(fatigue, 1),
+                       "fitness": round(fitness, 6), "fatigue": round(fatigue, 1),
                        "form": round(fitness - fatigue, 1)})
     visible_start = (today - datetime.timedelta(days=VISIBLE_DAYS)).isoformat()
     return [row for row in series if row["date"] >= visible_start]
@@ -3070,7 +3079,7 @@ function render(d){
   response.appendChild(effortCard);
   var fitnessCard=el("div","card");
   var fs=d.fitnessSeries||[],latest=fs[fs.length-1]||{};
-  fitnessCard.innerHTML='<div class="label"><p class="eyebrow">Fitness level · effort model</p><span class="pill good" id="fit-value">'+n(latest.fitness)+' index</span></div><div class="charttabs" id="fit-tabs"><button data-days="30" class="active">1 month</button><button data-days="90">3 months</button><button data-days="180">6 months</button><button data-days="365">1 year</button><button data-days="731">2 years</button></div><div class="fitsummary" id="fit-summary"></div><svg class="loadchart primarychart" id="fitnessc" viewBox="0 0 1000 360" preserveAspectRatio="none"></svg><div class="metricnote">A 42-day weighted average of your daily effort points, so it builds slowly and decays when you stop — the same input Strava builds its Fitness score from, on the same scale. The badge shows the selected day’s level; click any point to compare it with the first day of the period, or leave it on today.</div>';
+  fitnessCard.innerHTML='<div class="label"><p class="eyebrow">Fitness level · effort model</p><span class="pill good" id="fit-value">'+n(latest.fitness)+' index</span></div><div class="charttabs" id="fit-tabs"><button data-days="30" class="active">1 month</button><button data-days="90">3 months</button><button data-days="180">6 months</button><button data-days="365">1 year</button><button data-days="731">2 years</button></div><div class="fitsummary" id="fit-summary"></div><svg class="loadchart primarychart" id="fitnessc" viewBox="0 0 1000 360" preserveAspectRatio="none"></svg><div class="metricnote">A 42-day average calibrated to your Strava reference readings, with extra weight for harder activity. Fitness builds with training and decays with rest. Comparisons use calendar periods; Relative Effort scores are unchanged. The badge shows the selected day’s level; click any point to compare it with the first day of the period, or leave it on today.</div>';
   response.appendChild(fitnessCard);app.appendChild(response);
 
   // readiness contributors + sleep detail
@@ -3461,9 +3470,20 @@ function drawEffortWeek(week){
   chartTip(svg,days,function(x){return '<b>'+x.label+'</b><br>'+(x.effort==null?'Not yet':n(x.effort)+' effort points');});
 }
 
+function fitnessWindow(series,days){
+  if(!series.length)return [];
+  var months=days===30?1:days===90?3:days===180?6:days===365?12:24;
+  var last=new Date(series[series.length-1].date+'T00:00:00Z');
+  var first=new Date(Date.UTC(last.getUTCFullYear(),last.getUTCMonth()-months,1));
+  var monthEnd=new Date(Date.UTC(first.getUTCFullYear(),first.getUTCMonth()+1,0)).getUTCDate();
+  first.setUTCDate(Math.min(last.getUTCDate(),monthEnd));
+  var cutoff=first.toISOString().slice(0,10);
+  return series.filter(function(row){return row.date>=cutoff;});
+}
+
 function drawFitness(series,days,selectedIndex){
-  var svg=document.getElementById("fitnessc");if(!svg)return;svg.innerHTML="";var rows=series.slice(-days);if(!rows.length)return;
-  var selected=selectedIndex==null?rows.length-1:Math.max(0,Math.min(rows.length-1,selectedIndex)),first=rows[0].fitness||0,current=rows[selected].fitness||0,delta=current-first,pct=first>=1?delta/first*100:null,summary=document.getElementById("fit-summary"),value=document.getElementById("fit-value"),period=days===30?'30 days':days===90?'90 days':days===180?'six months':days===365?'year':'two years';
+  var svg=document.getElementById("fitnessc");if(!svg)return;svg.innerHTML="";var rows=fitnessWindow(series,days);if(!rows.length)return;
+  var selected=selectedIndex==null?rows.length-1:Math.max(0,Math.min(rows.length-1,selectedIndex)),first=rows[0].fitness||0,current=rows[selected].fitness||0,delta=current-first,pct=first>=1?delta/first*100:null,summary=document.getElementById("fit-summary"),value=document.getElementById("fit-value"),period=days===30?'month':days===90?'three months':days===180?'six months':days===365?'year':'two years';
   function fmt(date){return new Date(date+'T00:00:00').toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});}
   if(value)value.textContent=Math.round(current)+' index';
   if(summary){var pctText=pct==null?'—%':Math.abs(Math.round(pct))+'%',direction=pct==null?'':delta>0?'▲ ':delta<0?'▼ ':'';summary.innerHTML='<span class="change '+(delta>0?'up':'')+'">'+direction+pctText+'</span><span>'+(delta>0?'+':'')+Math.round(delta)+' pts</span><span class="period">'+(selected===rows.length-1?(rows.length<days-3?'over the '+rows.length+' days recorded so far':'over the past '+period):'from '+fmt(rows[0].date)+' to '+fmt(rows[selected].date))+'</span>';}
