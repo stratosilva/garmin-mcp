@@ -1802,7 +1802,15 @@ def _agg(items):
     }
 
 
-# Enough pages to reach 800 days even at several activities a day. Only a
+# The chart shows two years, but the Fitness average needs a long run-up
+# before that window opens or its oldest points are still climbing out of
+# their seed. Measured against this athlete's history, 1100 days settles the
+# two-year point (it moved the two-year change from +31% to +16%); going
+# further changed nothing.
+HISTORY_DAYS = 1100
+VISIBLE_DAYS = 730
+
+# Enough pages to reach that far even at several activities a day. Only a
 # safety stop: the loop normally exits as soon as it passes the cutoff.
 HISTORY_ACTIVITY_LIMIT = 4000
 
@@ -1824,11 +1832,11 @@ def _history_activities(client, today):
             _HISTORY_CACHE["activities"] = newest + retained
         return _HISTORY_CACHE["activities"]
     # Page back until the cutoff is genuinely reached. The previous 1000-activity
-    # ceiling was hit long before 800 days for anyone training most days, and it
+    # ceiling was hit long before the cutoff for anyone training most days, and it
     # truncated silently: Fitness then started part-way through the window, so
     # the oldest points sat near their seed and every long-period percentage was
     # computed against a value that was too low.
-    cutoff, gathered = today - datetime.timedelta(days=800), []
+    cutoff, gathered = today - datetime.timedelta(days=HISTORY_DAYS), []
     for start in range(0, HISTORY_ACTIVITY_LIMIT, 100):
         page = _call(client.get_activities, start, 100) or []
         mapped = [_map_activity(activity) for activity in page if isinstance(activity, dict)]
@@ -1873,13 +1881,13 @@ def _training_history(activities, today):
             date = datetime.datetime.strptime(activity["date"], "%Y-%m-%d").date()
         except (ValueError, TypeError):
             continue
-        if date > today or (today - date).days > 800:
+        if date > today or (today - date).days > HISTORY_DAYS:
             continue
         entry = daily.setdefault(date, {"garminLoad": 0.0, "effort": 0.0})
         garmin_load = activity.get("load") or 0
         entry["garminLoad"] += garmin_load
         entry["effort"] += activity.get("effort") or round(garmin_load / 3.0, 1)
-    start = max(min(daily) if daily else today, today - datetime.timedelta(days=800))
+    start = max(min(daily) if daily else today, today - datetime.timedelta(days=HISTORY_DAYS))
     span = (today - start).days + 1
 
     def effort_on(offset):
@@ -1905,7 +1913,7 @@ def _training_history(activities, today):
                        "garminLoad": round(entry.get("garminLoad") or 0, 1),
                        "fitness": round(fitness, 1), "fatigue": round(fatigue, 1),
                        "form": round(fitness - fatigue, 1)})
-    visible_start = (today - datetime.timedelta(days=730)).isoformat()
+    visible_start = (today - datetime.timedelta(days=VISIBLE_DAYS)).isoformat()
     return [row for row in series if row["date"] >= visible_start]
 
 
