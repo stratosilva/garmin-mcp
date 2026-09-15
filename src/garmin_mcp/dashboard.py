@@ -18,6 +18,7 @@ import os
 import shutil
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -410,10 +411,12 @@ def _read_strength_log_unlocked():
     try:
         payload = json.loads(_strength_log_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        return {"version": 1, "activities": {}}
+        return {"version": 1, "activities": {}, "manualWorkouts": {}}
     if not isinstance(payload, dict) or not isinstance(payload.get("activities"), dict):
-        return {"version": 1, "activities": {}}
+        return {"version": 1, "activities": {}, "manualWorkouts": {}}
     payload["version"] = 1
+    payload.setdefault("activities", {})
+    payload.setdefault("manualWorkouts", {})
     return payload
 
 
@@ -428,6 +431,23 @@ def _write_strength_log_unlocked(payload):
     temporary = target.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     temporary.replace(target)
+
+
+def _manual_strength_workouts_unlocked():
+    db = _dashboard_database()
+    if db:
+        return db.manual_strength_workouts()
+    return _read_strength_log_unlocked().get("manualWorkouts", {})
+
+
+def _save_manual_strength_workout_unlocked(manual_id, entry):
+    db = _dashboard_database()
+    if db:
+        db.save_manual_strength_workout(manual_id, entry)
+        return
+    store = _read_strength_log_unlocked()
+    store["manualWorkouts"][manual_id] = entry
+    _write_strength_log_unlocked(store)
 
 
 def _strength_text(value, field="exercise", maximum=120):
@@ -699,7 +719,159 @@ def _strength_summary(limit=8):
             "timedSeconds": round(timed_seconds, 1),
             "sets": sets,
         })
+    with _STRENGTH_LOG_LOCK:
+        manual_entries = list(_manual_strength_workouts_unlocked().values())
+    for entry in manual_entries:
+        sets = [dict(row) for row in _manual_strength_sets(entry) if isinstance(row, dict)]
+        estimate = _manual_strength_estimates(sets, [])
+        activities.append({"activityId": "manual:" + str(entry.get("manualId")), "name": entry.get("activityName"),
+                           "start": entry.get("activityStart"), "source": entry.get("source") or "manual",
+                           "workingSets": estimate["workingSets"], "externalLoadVolumeKg": estimate["externalLoadVolumeKg"],
+                           "timedSets": sum(1 for row in sets if row.get("reps") is None and row.get("durationSeconds")),
+                           "timedSeconds": estimate["timedSeconds"], "sets": sets})
+    activities.sort(key=lambda row: row.get("start") or "", reverse=True)
+    activities = activities[:limit]
     return {"activities": activities}
+
+
+def _manual_strength_sets(entry):
+    return entry.get("mergedSets") if entry.get("source") == "merged" else entry.get("sets", [])
+
+
+def _manual_strength_estimates(sets, garmin_activities):
+    """Estimate only dashboard effort/calories; Garmin Training Load stays absent."""
+    working = [row for row in sets if isinstance(row, dict) and row.get("exercise")]
+    volume = sum((row.get("reps") or 0) * (row.get("weightKg") or 0) * (2 if row.get("perSide") else 1)
+                 for row in working)
+    timed_minutes = sum((row.get("durationSeconds") or 0) * (2 if row.get("perSide") else 1)
+                        for row in working) / 60.0
+    historical_rates = []
+    for activity in garmin_activities:
+        calories, total_sets = activity.get("cal"), activity.get("totalSets")
+        if isinstance(calories, (int, float)) and calories > 0 and isinstance(total_sets, (int, float)) and total_sets > 0:
+            historical_rates.append(calories / total_sets)
+    historical_rates.sort()
+    kcal_per_set = historical_rates[len(historical_rates) // 2] if historical_rates else 5.5
+    calories = max(15.0, len(working) * kcal_per_set + timed_minutes * 3.0 + volume / 1500.0)
+    effort = len(working) * 0.8 + timed_minutes * 0.4 + volume / 10000.0
+    return {"workingSets": len(working), "externalLoadVolumeKg": round(volume, 1),
+            "timedSeconds": round(timed_minutes * 60, 1), "calories": round(calories),
+            "effort": round(max(1.0, effort), 1), "method": "personal strength-history per-set estimate" if historical_rates else "conservative set/volume estimate"}
+
+
+def _manual_workout_activity(entry, garmin_activities):
+    sets = _manual_strength_sets(entry)
+    estimate = _manual_strength_estimates(sets, garmin_activities)
+    start = entry.get("activityStart") or entry.get("updatedAt") or ""
+    activity = {
+        "activityId": "manual:" + str(entry.get("manualId")), "manualId": entry.get("manualId"),
+        "source": entry.get("source") or "manual", "sport": "other", "typeKey": "strength_training",
+        "isStrength": True, "name": entry.get("activityName") or "Manual strength workout",
+        "date": start[:10], "start": start, "km": 0, "min": round(estimate["timedSeconds"] / 60),
+        "hr": None, "maxHr": None, "cal": estimate["calories"], "pace": None, "load": None,
+        "zones": [0, 0, 0, 0, 0], "effort": estimate["effort"], "effortZonePart": None,
+        "effortLoadPart": None, "location": None, "totalSets": estimate["workingSets"],
+        "totalReps": sum((row.get("reps") or 0) for row in sets if isinstance(row, dict)),
+        "totalVolumeGrams": estimate["externalLoadVolumeKg"] * 1000,
+        "estimate": estimate,
+    }
+    if entry.get("source") == "merged":
+        garmin = next((row for row in garmin_activities if str(row.get("activityId")) == str(entry.get("mergedGarminActivityId"))), None)
+        if garmin:
+            for field in ("min", "hr", "maxHr", "cal", "load", "zones", "effort", "effortZonePart", "effortLoadPart", "location"):
+                activity[field] = garmin.get(field)
+            activity["date"] = garmin.get("date") or activity["date"]
+            activity["start"] = garmin.get("start") or activity["start"]
+            activity["estimate"] = None
+    return activity
+
+
+def _manual_strength_payload(manual_id):
+    with _STRENGTH_LOG_LOCK:
+        entry = _manual_strength_workouts_unlocked().get(manual_id)
+    if not isinstance(entry, dict):
+        raise ValueError("manual workout was not found")
+    payload = dict(entry)
+    payload["manualId"] = manual_id
+    payload["exercises"] = _strength_exercise_catalog()
+    payload["recentExercises"] = []
+    return payload
+
+
+def _save_manual_strength_workout(manual_id, payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get("sets"), list):
+        raise ValueError("a list of strength sets is required")
+    if len(payload["sets"]) > 200:
+        raise ValueError("a workout cannot contain more than 200 sets")
+    sets, seen = [], set()
+    for position, row in enumerate(payload["sets"]):
+        clean = _validated_strength_set(row, "manual", position)
+        if clean is None:
+            continue
+        if clean["id"] in seen:
+            raise ValueError("set ids must be unique")
+        seen.add(clean["id"])
+        sets.append(clean)
+    if not sets:
+        raise ValueError("add at least one completed set")
+    name = _strength_text(payload.get("activityName"), "workout name") or "Manual strength workout"
+    start = _strength_text(payload.get("activityStart"), "workout start", 50)
+    if not start:
+        start = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    entry = {"manualId": manual_id, "activityName": name, "activityStart": start,
+             "sets": sets, "source": "manual", "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    with _STRENGTH_LOG_LOCK:
+        _save_manual_strength_workout_unlocked(manual_id, entry)
+    return entry
+
+
+def _manual_merge_candidates(client, manual_id):
+    entry = _manual_strength_payload(manual_id)
+    try:
+        manual_start = datetime.datetime.fromisoformat(str(entry["activityStart"]).replace("Z", "+00:00"))
+    except ValueError:
+        return []
+    candidates = []
+    for raw in _call(client.get_activities, 0, 40) or []:
+        activity = _map_activity(raw) if isinstance(raw, dict) else None
+        if not activity or not activity.get("isStrength") or not activity.get("start"):
+            continue
+        try:
+            started = datetime.datetime.fromisoformat(activity["start"].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if abs((started - manual_start).total_seconds()) <= 24 * 3600:
+            candidates.append(activity)
+    return sorted(candidates, key=lambda row: abs((datetime.datetime.fromisoformat(row["start"].replace("Z", "+00:00")) - manual_start).total_seconds()))[:3]
+
+
+def _merge_manual_strength_workout(client, manual_id, garmin_activity_id):
+    entry = _manual_strength_payload(manual_id)
+    garmin_id = _strength_activity_id(garmin_activity_id)
+    candidates = {str(row["activityId"]) for row in _manual_merge_candidates(client, manual_id)}
+    if str(garmin_id) not in candidates:
+        raise ValueError("choose one of the recent Garmin strength workouts")
+    garmin_sets = _normalise_garmin_strength_sets(client.get_activity_exercise_sets(garmin_id))
+    manual_sets = entry.get("sets") or []
+    merged = []
+    for index, raw in enumerate(garmin_sets):
+        row = dict(raw)
+        if index < len(manual_sets):
+            row["exercise"] = manual_sets[index].get("exercise")
+            row["source"] = "merged"
+        else:
+            row["exercise"] = None
+            row["source"] = "garmin-unlabelled"
+        merged.append(row)
+    for row in manual_sets[len(garmin_sets):]:
+        extra = dict(row)
+        extra["source"] = "manual"
+        merged.append(extra)
+    entry.update({"source": "merged", "mergedGarminActivityId": garmin_id, "mergedSets": merged,
+                  "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    with _STRENGTH_LOG_LOCK:
+        _save_manual_strength_workout_unlocked(manual_id, entry)
+    return entry
 
 
 def _strength_muscles(exercise):
@@ -1862,10 +2034,16 @@ def gather(client):
     # ---- activities -> training categories ----
     raw = _call(client.get_activities, 0, 40) or []
     acts = [_map_activity(a) for a in raw if isinstance(a, dict)]
+    with _STRENGTH_LOG_LOCK:
+        manual_entries = list(_manual_strength_workouts_unlocked().values())
+    manual_activities = [_manual_workout_activity(entry, acts) for entry in manual_entries if isinstance(entry, dict)]
+    merged_garmin_ids = {str(entry.get("mergedGarminActivityId")) for entry in manual_entries if entry.get("source") == "merged"}
+    acts = [row for row in acts if str(row.get("activityId")) not in merged_garmin_ids]
+    acts = sorted(acts + manual_activities, key=lambda row: row.get("start") or "", reverse=True)
     out["recent"] = acts[:12]
     strength_history = _strength_summary(limit=200)
     out["strength"] = {"activities": strength_history["activities"][:8]}
-    history = _history_activities(client, today)
+    history = [row for row in _history_activities(client, today) if str(row.get("activityId")) not in merged_garmin_ids] + manual_activities
     out["fitnessSeries"] = _training_history(history, today)
     muscle_start = today - datetime.timedelta(days=today.weekday(), weeks=11)
     daily_steps = _call(client.get_daily_steps, muscle_start.isoformat(), ds) or daily_stats
@@ -2084,6 +2262,43 @@ def add_dashboard_routes(asgi_app, client):
         except (ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
+    async def manual_strength_workout(request):
+        try:
+            manual_id = request.path_params.get("manual_id")
+            if request.method == "GET":
+                return JSONResponse(_manual_strength_payload(manual_id))
+            return JSONResponse(_save_manual_strength_workout(manual_id, await request.json()), status_code=201)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def create_manual_strength_workout(request):
+        try:
+            manual_id = "manual-" + uuid.uuid4().hex
+            return JSONResponse(_save_manual_strength_workout(manual_id, await request.json()), status_code=201)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def strength_exercises(_request):
+        return JSONResponse({"exercises": _strength_exercise_catalog()})
+
+    async def manual_strength_candidates(request):
+        if client is None:
+            return JSONResponse({"error": "garmin client not ready"}, status_code=503)
+        try:
+            return JSONResponse({"candidates": _manual_merge_candidates(client, request.path_params.get("manual_id"))})
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def merge_manual_strength_workout(request):
+        if client is None:
+            return JSONResponse({"error": "garmin client not ready"}, status_code=503)
+        try:
+            body = await request.json()
+            entry = _merge_manual_strength_workout(client, request.path_params.get("manual_id"), body.get("garminActivityId"))
+            return JSONResponse(entry)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
     async def recommendation(request):
         """Serve today's saved advice, unless the athlete explicitly asks to refresh it."""
         try:
@@ -2122,6 +2337,11 @@ def add_dashboard_routes(asgi_app, client):
     asgi_app.router.routes.append(Route("/api/body-measurements", body_measurements, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/injury-measurements", injury_measurements, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/strength-activities/{activity_id:int}", strength_activity, methods=["GET", "POST"]))
+    asgi_app.router.routes.append(Route("/api/strength-exercises", strength_exercises, methods=["GET"]))
+    asgi_app.router.routes.append(Route("/api/manual-strength-workouts", create_manual_strength_workout, methods=["POST"]))
+    asgi_app.router.routes.append(Route("/api/manual-strength-workouts/{manual_id}", manual_strength_workout, methods=["GET", "POST"]))
+    asgi_app.router.routes.append(Route("/api/manual-strength-workouts/{manual_id}/candidates", manual_strength_candidates, methods=["GET"]))
+    asgi_app.router.routes.append(Route("/api/manual-strength-workouts/{manual_id}/merge", merge_manual_strength_workout, methods=["POST"]))
     asgi_app.router.routes.append(Route("/api/recommendation", recommendation, methods=["POST"]))
     asgi_app.router.routes.append(Route("/dashboard", page, methods=["GET"]))
     asgi_app.router.routes.append(Route("/favicon.ico", favicon, methods=["GET"]))
@@ -2302,12 +2522,13 @@ function ensureStrengthModal(){
   modal.querySelectorAll("[data-strength-close]").forEach(function(button){button.addEventListener("click",closeStrengthEditor);});
   modal.querySelector("#strength-save").addEventListener("click",saveStrengthDetails);
   modal.addEventListener("input",function(event){if(event.target.matches("input")){event.target.classList.add("changed");STRENGTH_DIRTY=true;setStrengthStatus("Unsaved changes");if(event.target.matches('[data-strength-field="perSide"]')){var label=event.target.closest("[data-strength-row]").querySelector("[data-strength-reps-label]");if(label)label.textContent=event.target.checked?"Reps/side":"Reps";}}});
-  modal.addEventListener("click",function(event){
+    modal.addEventListener("click",function(event){
     var apply=event.target.closest("[data-strength-apply]");if(apply){applyExerciseToThree(apply.dataset.strengthApply);return;}
     var copy=event.target.closest("[data-manual-copy]");if(copy){copyPreviousManualSet(copy);return;}
     if(event.target.closest("[data-strength-add]")){addManualStrengthGroup();return;}
     var remove=event.target.closest("[data-strength-remove]");if(remove){remove.closest(".strength-manual-group").remove();STRENGTH_DIRTY=true;setStrengthStatus("Manual exercise removed — save to confirm");return;}
     if(event.target.closest("[data-strength-revert]")){revertGarminStrengthRows();}
+    var merge=event.target.closest("[data-manual-merge]");if(merge){mergeManualStrengthWorkout(merge.dataset.manualMerge);}
   });
   return modal;
 }
@@ -2340,6 +2561,25 @@ function renderStrengthEditor(){
   var content=document.getElementById("strength-editor-content");
   content.innerHTML='<datalist id="strength-exercise-options">'+options+'</datalist>'+(payload.warning?'<div class="strength-banner warn">'+esc(payload.warning)+'</div>':'<div class="strength-banner">Garmin values stay recoverable. Saved corrections are used by this dashboard and its AI advice.</div>')+'<div class="strength-editor-title"><div><h3>Garmin sets</h3><p>Tap any value to correct it. Use reps, seconds, or both; weight is optional.</p></div><button type="button" class="strength-apply" data-strength-revert>Revert Garmin values</button></div><div class="strength-set-list">'+(garmin.length?garmin.map(strengthGarminRow).join(""):'<div class="strength-empty">Garmin did not return any recorded sets. You can still add the exercises manually below.</div>')+'</div><div class="strength-editor-title"><div><h3>Sets Garmin missed</h3><p>Adds three sets by default; copy the previous set when values repeat.</p></div><button type="button" class="strength-add" data-strength-add>+ Add exercise</button></div><div class="strength-manual-list">'+groupOrder.map(function(key,index){return strengthManualGroup(grouped[key],index);}).join("")+'</div><p class="strength-status" id="strength-status" aria-live="polite">'+(payload.savedAt?"Last saved "+new Date(payload.savedAt).toLocaleString():"Not saved yet")+'</p>';
 }
+
+function renderManualStrengthEditor(){
+  var payload=STRENGTH_STATE.payload||{},sets=payload.sets||[],recent=(payload.recentExercises||[]).concat(payload.exercises||[]),seen={},options=recent.filter(function(name){var key=String(name).toLowerCase();if(!name||seen[key])return false;seen[key]=true;return true;}).map(function(name){return '<option value="'+esc(name)+'"></option>';}).join(""),grouped={},groupOrder=[];
+  sets.forEach(function(row){var key=manualGroupKey(row);if(!grouped[key]){grouped[key]=[];groupOrder.push(key);}grouped[key].push(row);});
+  var merge=payload.manualId?'<div class="strength-editor-title"><div><h3>Match Garmin workout</h3><p>Numbers come from Garmin; your exercise names stay. Your original manual entry remains saved.</p></div><button type="button" class="strength-apply" data-manual-candidates>Show 3 nearby Garmin workouts</button></div><div id="manual-merge-candidates"></div>':'';
+  document.getElementById("strength-editor-content").innerHTML='<datalist id="strength-exercise-options">'+options+'</datalist><div class="strength-banner">No session timer. Enter seconds only for time-based sets such as Farmer’s Walk. Calories and strength effort are clearly estimated; Garmin Training Load is never created.</div><label class="strength-field">Workout name<input id="manual-workout-name" value="'+esc(payload.activityName||"Manual strength workout")+'" placeholder="Gym workout"></label><div class="strength-editor-title"><div><h3>Your sets</h3><p>Add an exercise, then reps or seconds and optional weight.</p></div><button type="button" class="strength-add" data-strength-add>+ Add exercise</button></div><div class="strength-manual-list">'+groupOrder.map(function(key,index){return strengthManualGroup(grouped[key],index);}).join("")+'</div>'+merge+'<p class="strength-status" id="strength-status" aria-live="polite">'+(payload.updatedAt?"Last saved "+new Date(payload.updatedAt).toLocaleString():"Not saved yet")+'</p>';
+  var candidateButton=document.querySelector("[data-manual-candidates]");if(candidateButton)candidateButton.addEventListener("click",loadManualMergeCandidates);
+}
+
+function openManualStrengthEditor(manualId){
+  var modal=ensureStrengthModal(),newWorkout=!manualId;STRENGTH_STATE={mode:"manual",activity:{},payload:{manualId:manualId||null,activityName:"Manual strength workout",activityStart:new Date().toISOString(),sets:[]}};STRENGTH_DIRTY=false;modal.hidden=false;document.body.classList.add("modal-open");
+  document.getElementById("strength-dialog-title").textContent="Manual gym workout";document.getElementById("strength-dialog-meta").textContent="Enter completed sets as you train";document.getElementById("strength-editor-content").innerHTML='<div class="state"><div><div class="spin"></div>Loading workout…</div></div>';
+  var done=function(payload){STRENGTH_STATE.payload=payload;if(!payload.sets.length){var key="manual:"+Date.now().toString(36);for(var i=0;i<3;i++)payload.sets.push({id:key+":"+i,source:"manual",setType:"ACTIVE",exercise:null,reps:null,durationSeconds:null,weightKg:null,perSide:false});}renderManualStrengthEditor();};
+  if(newWorkout){fetch("/api/strength-exercises",{headers:{Authorization:"Bearer "+TOKEN}}).then(function(r){return r.ok?r.json():{};}).then(function(reference){STRENGTH_STATE.payload.exercises=reference.exercises||[];done(STRENGTH_STATE.payload);}).catch(function(){done(STRENGTH_STATE.payload);});}
+  else fetch("/api/manual-strength-workouts/"+encodeURIComponent(manualId),{headers:{Authorization:"Bearer "+TOKEN}}).then(function(r){return r.json().then(function(b){if(!r.ok)throw new Error(b.error||"Could not load workout");return b;});}).then(done).catch(function(error){document.getElementById("strength-editor-content").innerHTML='<div class="strength-empty">'+esc(error.message)+'</div>';});
+}
+
+function loadManualMergeCandidates(){var id=(STRENGTH_STATE.payload||{}).manualId,target=document.getElementById("manual-merge-candidates");if(!id||!target)return;target.innerHTML='<div class="strength-empty">Looking for recent Garmin strength workouts…</div>';fetch("/api/manual-strength-workouts/"+encodeURIComponent(id)+"/candidates",{headers:{Authorization:"Bearer "+TOKEN}}).then(function(r){return r.json().then(function(b){if(!r.ok)throw new Error(b.error||"Could not load candidates");return b;});}).then(function(data){var rows=data.candidates||[];target.innerHTML=rows.length?rows.map(function(row){return '<div class="strength-set-row"><div class="strength-set-meta"><div><b>'+esc(row.name)+'</b><span>'+esc((row.start||"").replace("T"," "))+'</span></div><button type="button" class="strength-apply" data-manual-merge="'+esc(row.activityId)+'">Merge</button></div><p class="strength-original">Garmin: '+n(row.totalSets)+' sets · '+n(row.cal)+' kcal. Garmin numbers will replace matched set values.</p></div>';}).join(""):'<div class="strength-empty">No Garmin strength workout was found within 24 hours.</div>';}).catch(function(error){target.innerHTML='<div class="strength-empty">'+esc(error.message)+'</div>';});}
+function mergeManualStrengthWorkout(garminActivityId){var id=(STRENGTH_STATE.payload||{}).manualId;if(!id||!window.confirm("Merge this manual workout with the selected Garmin workout? Your original manual sets will be retained."))return;fetch("/api/manual-strength-workouts/"+encodeURIComponent(id)+"/merge",{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({garminActivityId:garminActivityId})}).then(function(r){return r.json().then(function(b){if(!r.ok)throw new Error(b.error||"Could not merge");return b;});}).then(function(){setStrengthStatus("Merged. Refreshing dashboard…");setTimeout(function(){closeStrengthEditor();load();},350);}).catch(function(error){setStrengthStatus(error.message,true);});}
 
 function openStrengthEditor(activityId){
   var activity=((CURRENT_DASHBOARD||{}).recent||[]).find(function(row){return String(row.activityId)===String(activityId);})||(((CURRENT_DASHBOARD||{}).workouts||{}).lastStrength)||{};
@@ -2380,7 +2620,8 @@ function addManualStrengthGroup(){
 
 function saveStrengthDetails(){
   var button=document.getElementById("strength-save"),sets;try{sets=collectStrengthSets();}catch(error){setStrengthStatus(error.message,true);return;}button.disabled=true;button.textContent="Saving…";setStrengthStatus("Saving details…");var activity=STRENGTH_STATE.activity||{};
-  fetch("/api/strength-activities/"+encodeURIComponent(activity.activityId),{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({activityName:activity.name,activityStart:activity.start,sets:sets})})
+  var manual=STRENGTH_STATE.mode==="manual",payload={activityName:manual?document.getElementById("manual-workout-name").value.trim():activity.name,activityStart:manual?(STRENGTH_STATE.payload.activityStart||new Date().toISOString()):activity.start,sets:sets},endpoint=manual?(STRENGTH_STATE.payload.manualId?"/api/manual-strength-workouts/"+encodeURIComponent(STRENGTH_STATE.payload.manualId):"/api/manual-strength-workouts"):"/api/strength-activities/"+encodeURIComponent(activity.activityId);
+  fetch(endpoint,{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify(payload)})
     .then(function(response){return response.json().then(function(body){if(!response.ok)throw new Error(body.error||"Could not save strength details");return body;});})
     .then(function(payload){STRENGTH_STATE.payload=payload;STRENGTH_DIRTY=false;setStrengthStatus("Saved. Updating the dashboard and advice…");setTimeout(function(){var modal=document.getElementById("strength-modal");if(modal)modal.hidden=true;document.body.classList.remove("modal-open");load();},450);})
     .catch(function(error){setStrengthStatus(error.message,true);})
@@ -2456,8 +2697,8 @@ function SPORT(meta,d){
 function WORKOUTS(d){
   var s=d.workouts||{},c=el("div","card sport walk");
   var head='<div class="top"><span class="ico">🏋️</span><div><h3>Workouts</h3><div class="d">HIIT · rowing · SkiErg · elliptical</div></div></div>';
-  if(!s.hasData){c.innerHTML=head+'<div class="empty"><span class="pill mute">Ready</span><span class="msg">Log a gym, cardio or indoor-machine activity in Garmin and it will appear here.</span></div>';return c;}
-  var wk=s.week||{},last=s.last||{},strength=s.lastStrength||{},types=(s.types||[]).map(function(x){return x.name+' · '+x.count;}).join(' · '),action=strength.activityId?'<button type="button" class="rf strength-card-action" data-strength-id="'+esc(strength.activityId)+'">Edit latest strength details</button>':'';
+  if(!s.hasData){c.innerHTML=head+'<div class="empty"><span class="pill mute">Ready</span><span class="msg">Log a gym workout here, or sync one from Garmin.</span></div><button type="button" class="rf" data-manual-strength-new>Log gym workout</button>';return c;}
+  var wk=s.week||{},last=s.last||{},strength=s.lastStrength||{},types=(s.types||[]).map(function(x){return x.name+' · '+x.count;}).join(' · '),action=(strength.activityId&&String(strength.activityId).indexOf("manual:")!==0?'<button type="button" class="rf strength-card-action" data-strength-id="'+esc(strength.activityId)+'">Edit latest strength details</button>':'')+'<button type="button" class="rf strength-card-action" data-manual-strength-new>Log gym workout</button>';
   c.innerHTML=head+'<div class="tstat"><div class="t"><div class="n">'+n(wk.sessions)+'</div><div class="l">sessions · 7d</div></div><div class="t"><div class="n">'+n(wk.min)+'</div><div class="l">minutes · 7d</div></div><div class="t"><div class="n">'+comma(wk.cal)+'</div><div class="l">kcal · 7d</div></div></div><div class="last">Last: <b>'+n(last.name)+'</b> · '+n(last.min)+' min'+(last.hr?' · '+last.hr+' bpm':'')+'<br><span style="color:var(--faint)">'+types+'</span></div>'+action;
   return c;
 }
@@ -2746,7 +2987,7 @@ function render(d){
     var col={swim:"var(--swim)",bike:"var(--bike)",run:"var(--run)",walk:"var(--accent)"}[a.sport]||"var(--accent)";
     var r=el("div","act");
     r.innerHTML='<div class="nm"><span class="ic" style="background:color-mix(in srgb,'+col+' 18%,transparent)">'+ic+'</span>'+
-      '<span class="t">'+a.name+'<small>'+(a.start||"").replace("T"," ")+(a.location?" · "+a.location:"")+'</small>'+(a.isStrength&&a.activityId?'<button type="button" class="strength-open" data-strength-id="'+esc(a.activityId)+'">Edit exercise sets</button>':'')+'</span></div>'+
+      '<span class="t">'+a.name+'<small>'+(a.start||"").replace("T"," ")+(a.location?" · "+a.location:"")+(a.source?" · source: "+a.source:"")+'</small>'+(a.manualId?'<button type="button" class="strength-open" data-manual-strength-id="'+esc(a.manualId)+'">Edit / merge</button>':(a.isStrength&&a.activityId?'<button type="button" class="strength-open" data-strength-id="'+esc(a.activityId)+'">Edit exercise sets</button>':''))+'</span></div>'+
       '<div class="c" data-k="Dist"><b>'+n(a.km)+'</b> km</div>'+
       '<div class="c" data-k="Time"><b>'+n(a.min)+'</b> min</div>'+
       '<div class="c hidesm" data-k="HR"><b>'+n(a.hr)+'</b> bpm</div>'+
@@ -2777,6 +3018,8 @@ function render(d){
   document.getElementById("body-entry-toggle").addEventListener("click",function(){toggleEntry("body-entry");});
   document.getElementById("injury-entry-toggle").addEventListener("click",function(){toggleEntry("injury-entry");});
   document.querySelectorAll("[data-strength-id]").forEach(function(button){button.addEventListener("click",function(){openStrengthEditor(button.dataset.strengthId);});});
+  document.querySelectorAll("[data-manual-strength-new]").forEach(function(button){button.addEventListener("click",function(){openManualStrengthEditor();});});
+  document.querySelectorAll("[data-manual-strength-id]").forEach(function(button){button.addEventListener("click",function(){openManualStrengthEditor(button.dataset.manualStrengthId);});});
   document.getElementById("body-entry").addEventListener("submit",function(event){event.preventDefault();var data={timestamp:new Date().toISOString()};new FormData(event.target).forEach(function(value,key){data[key]=value;});var status=document.getElementById("body-entry-status");status.textContent="Saving…";fetch("/api/body-measurements",{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify(data)}).then(function(r){return r.json().then(function(body){if(!r.ok)throw new Error(body.error||"Could not save measurement");return body;});}).then(function(){status.textContent="Saved. Refreshing dashboard…";load();}).catch(function(error){status.textContent=error.message;});});
   document.getElementById("injury-entry").addEventListener("submit",function(event){event.preventDefault();saveEntry("/api/injury-measurements","injury-entry","injury-entry-status");});
 }

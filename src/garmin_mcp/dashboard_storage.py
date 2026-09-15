@@ -71,6 +71,17 @@ class DashboardDatabase:
                     )
                 """)
                 cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS dashboard_manual_strength_workouts (
+                        manual_id TEXT PRIMARY KEY,
+                        activity_name TEXT NOT NULL,
+                        activity_start TIMESTAMPTZ NOT NULL,
+                        payload JSONB NOT NULL,
+                        merged_garmin_activity_id BIGINT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS dashboard_data_migrations (
                         migration_key TEXT PRIMARY KEY,
                         completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -229,6 +240,38 @@ class DashboardDatabase:
                     updated_at = EXCLUDED.updated_at
             """, (activity_id, entry.get("activityName"), entry.get("activityStart"),
                    json.dumps(entry), entry.get("updatedAt")))
+
+    def manual_strength_workouts(self):
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT manual_id, payload, merged_garmin_activity_id
+                FROM dashboard_manual_strength_workouts
+                ORDER BY activity_start DESC
+            """)
+            workouts = {}
+            for manual_id, payload, merged_id in cursor.fetchall():
+                row = dict(payload or {})
+                row["manualId"] = manual_id
+                row["mergedGarminActivityId"] = merged_id
+                workouts[manual_id] = row
+            return workouts
+
+    def save_manual_strength_workout(self, manual_id, entry):
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO dashboard_manual_strength_workouts
+                    (manual_id, activity_name, activity_start, payload, merged_garmin_activity_id, updated_at)
+                VALUES (%s, %s, %s, %s::jsonb, %s, NOW())
+                ON CONFLICT (manual_id) DO UPDATE SET
+                    activity_name = EXCLUDED.activity_name,
+                    activity_start = EXCLUDED.activity_start,
+                    payload = EXCLUDED.payload,
+                    merged_garmin_activity_id = EXCLUDED.merged_garmin_activity_id,
+                    updated_at = NOW()
+            """, (manual_id, entry.get("activityName"), entry.get("activityStart"),
+                   json.dumps(entry), entry.get("mergedGarminActivityId")))
 
 
 def database(body_path=None, injury_path=None, strength_path=None):
