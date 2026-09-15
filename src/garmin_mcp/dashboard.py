@@ -1832,8 +1832,20 @@ def _history_activities(client, today):
     return gathered
 
 
+FITNESS_DAYS = 42.0    # Banister-style long response: accumulated training
+FATIGUE_DAYS = 7.0     # short response: recent tiredness
+FITNESS_SEED_DAYS = 42  # opening window used to prime the averages
+
+
 def _training_history(activities, today):
-    """Build separate effort and Garmin-load Fitness series (Banister-style)."""
+    """Build the Fitness/Fatigue series from Strava-comparable effort points.
+
+    Fitness is an exponentially weighted average of daily Relative Effort, the
+    same input Strava documents for its Fitness score. It deliberately does not
+    use Garmin's EPOC-based Training Load: that runs on a different scale (a
+    little over twice these points), so mixing the two shifted both the index
+    and every percentage change quoted against it.
+    """
     daily = {}
     for activity in activities:
         try:
@@ -1846,16 +1858,32 @@ def _training_history(activities, today):
         garmin_load = activity.get("load") or 0
         entry["garminLoad"] += garmin_load
         entry["effort"] += activity.get("effort") or round(garmin_load / 3.0, 1)
-    start, fitness, fatigue, series = max(min(daily) if daily else today, today - datetime.timedelta(days=800)), 0.0, 0.0, []
-    for offset in range((today - start).days + 1):
-        date, entry = start + datetime.timedelta(days=offset), daily.get(start + datetime.timedelta(days=offset), {})
-        # Fitness intentionally uses Garmin's EPOC-based Training Load. This was
-        # the earlier dashboard model and produces the user's expected ~13.5
-        # index. The HR-zone Relative Effort score remains a separate series.
-        load = entry.get("garminLoad") or entry.get("effort") or 0.0
-        fitness += (load - fitness) / 42.0
-        fatigue += (load - fatigue) / 7.0
-        series.append({"date": date.isoformat(), "label": date.strftime("%b %-d"), "load": round(load, 1), "effort": round(entry.get("effort") or 0, 1), "garminLoad": round(entry.get("garminLoad") or 0, 1), "fitness": round(fitness, 1), "fatigue": round(fatigue, 1), "form": round(fitness - fatigue, 1)})
+    start = max(min(daily) if daily else today, today - datetime.timedelta(days=800))
+    span = (today - start).days + 1
+
+    def effort_on(offset):
+        return (daily.get(start + datetime.timedelta(days=offset), {}) or {}).get("effort") or 0.0
+
+    # Seed both averages with the opening weeks' mean daily effort. Starting
+    # from zero would leave the oldest visible points still climbing out of the
+    # warm-up, which understated them and inflated every long-period gain.
+    seed_days = min(FITNESS_SEED_DAYS, span)
+    seed = sum(effort_on(offset) for offset in range(seed_days)) / seed_days if seed_days else 0.0
+    fitness = fatigue = seed
+    series = []
+    for offset in range(span):
+        date = start + datetime.timedelta(days=offset)
+        entry = daily.get(date, {})
+        load = entry.get("effort") or 0.0
+        fitness += (load - fitness) / FITNESS_DAYS
+        fatigue += (load - fatigue) / FATIGUE_DAYS
+        # "%b %-d" is a POSIX-only directive that raises on Windows, so the day
+        # number is interpolated directly to keep the module importable there.
+        series.append({"date": date.isoformat(), "label": f"{date:%b} {date.day}",
+                       "load": round(load, 1), "effort": round(load, 1),
+                       "garminLoad": round(entry.get("garminLoad") or 0, 1),
+                       "fitness": round(fitness, 1), "fatigue": round(fatigue, 1),
+                       "form": round(fitness - fatigue, 1)})
     visible_start = (today - datetime.timedelta(days=730)).isoformat()
     return [row for row in series if row["date"] >= visible_start]
 
@@ -2984,7 +3012,7 @@ function render(d){
   response.appendChild(effortCard);
   var fitnessCard=el("div","card");
   var fs=d.fitnessSeries||[],latest=fs[fs.length-1]||{};
-  fitnessCard.innerHTML='<div class="label"><p class="eyebrow">Fitness level · Garmin-load model</p><span class="pill good" id="fit-value">'+n(latest.fitness)+' index</span></div><div class="charttabs" id="fit-tabs"><button data-days="30" class="active">1 month</button><button data-days="90">3 months</button><button data-days="180">6 months</button><button data-days="365">1 year</button><button data-days="731">2 years</button></div><div class="fitsummary" id="fit-summary"></div><svg class="loadchart primarychart" id="fitnessc" viewBox="0 0 1000 360" preserveAspectRatio="none"></svg><div class="metricnote">Click any point to compare it with the first day of the selected period. With no selection, today is used. Uses Garmin’s EPOC-based Training Load.</div>';
+  fitnessCard.innerHTML='<div class="label"><p class="eyebrow">Fitness level · effort model</p><span class="pill good" id="fit-value">'+n(latest.fitness)+' index</span></div><div class="charttabs" id="fit-tabs"><button data-days="30" class="active">1 month</button><button data-days="90">3 months</button><button data-days="180">6 months</button><button data-days="365">1 year</button><button data-days="731">2 years</button></div><div class="fitsummary" id="fit-summary"></div><svg class="loadchart primarychart" id="fitnessc" viewBox="0 0 1000 360" preserveAspectRatio="none"></svg><div class="metricnote">A 42-day weighted average of your daily effort points, so it builds slowly and decays when you stop — the same input Strava builds its Fitness score from, on the same scale. Click any point to compare it with the first day of the selected period; with no selection, today is used.</div>';
   response.appendChild(fitnessCard);app.appendChild(response);
 
   // readiness contributors + sleep detail
@@ -3386,7 +3414,7 @@ function drawFitness(series,days,selectedIndex){
   [0,max/2,max].forEach(function(v){var l=document.createElementNS(ns,"line"),t=document.createElementNS(ns,"text");l.setAttribute("x1",pL);l.setAttribute("x2",W-pR);l.setAttribute("y1",Y(v));l.setAttribute("y2",Y(v));l.setAttribute("stroke",css("--border"));svg.appendChild(l);t.setAttribute("x",pL-10);t.setAttribute("y",Y(v)+5);t.setAttribute("text-anchor","end");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));t.textContent=Math.round(v);svg.appendChild(t)});
   var area=rows.map(function(x,i){return(i?"L":"M")+X(i).toFixed(1)+" "+Y(x.fitness||0).toFixed(1);}).join(" ")+" L"+X(rows.length-1)+" "+Y(0)+" L"+X(0)+" "+Y(0)+" Z",fill=document.createElementNS(ns,"path");fill.setAttribute("d",area);fill.setAttribute("fill",css("--accent"));fill.setAttribute("fill-opacity",".18");svg.appendChild(fill);plot("fitness",css("--accent"));
   var marker=document.createElementNS(ns,"line"),dot=document.createElementNS(ns,"circle");marker.setAttribute("x1",X(selected));marker.setAttribute("x2",X(selected));marker.setAttribute("y1",pT);marker.setAttribute("y2",H-pB);marker.setAttribute("stroke",css("--accent"));marker.setAttribute("stroke-width",2);svg.appendChild(marker);dot.setAttribute("cx",X(selected));dot.setAttribute("cy",Y(current));dot.setAttribute("r",7);dot.setAttribute("fill",css("--accent"));dot.setAttribute("stroke",css("--surface"));dot.setAttribute("stroke-width",3);svg.appendChild(dot);
-  [0,Math.floor(rows.length/2),rows.length-1].forEach(function(i){var t=document.createElementNS(ns,"text");t.setAttribute("x",X(i));t.setAttribute("y",H-10);t.setAttribute("text-anchor","middle");t.setAttribute("font-size",17);t.setAttribute("fill",css("--faint"));t.textContent=rows[i].label;svg.appendChild(t)});chartTip(svg,rows,function(x){return '<b>'+x.label+'</b><br>Fitness: '+x.fitness+'<br>Fatigue: '+x.fatigue+'<br>Form: '+x.form+'<br>Load: '+x.load;});
+  [0,Math.floor(rows.length/2),rows.length-1].forEach(function(i){var t=document.createElementNS(ns,"text");t.setAttribute("x",X(i));t.setAttribute("y",H-10);t.setAttribute("text-anchor","middle");t.setAttribute("font-size",17);t.setAttribute("fill",css("--faint"));t.textContent=rows[i].label;svg.appendChild(t)});chartTip(svg,rows,function(x){return '<b>'+x.label+'</b><br>Fitness: '+x.fitness+'<br>Fatigue: '+x.fatigue+'<br>Form: '+x.form+'<br>Effort that day: '+x.load+' pts';});
   svg.onclick=function(e){var r=svg.getBoundingClientRect(),chartX=(e.clientX-r.left)/r.width*W,i=Math.round((chartX-pL)/(W-pL-pR)*(rows.length-1));drawFitness(series,days,Math.max(0,Math.min(rows.length-1,i)));};
 }
 
