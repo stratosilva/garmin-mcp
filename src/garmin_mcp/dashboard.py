@@ -1713,6 +1713,28 @@ def _recovery_metrics(sleep_series, hrv_series, rhr_series, wellness, effort, ag
 # are treated as walks (the user walks around 80–100 bpm and runs 125+).
 TREADMILL_RUN_HR = 120
 
+# Aerobic effort points per minute, by average heart rate, for activities that
+# carry no time-in-zone breakdown. Fitted to the 379 recorded activities that do
+# carry one: on a 30% holdout this reproduces 95% of their aerobic total, with a
+# median error of 0.5 points on a 12-point activity.
+_AEROBIC_RATE_BY_HR = ((90, 0.125), (100, 0.132), (110, 0.149), (120, 0.186),
+                       (130, 0.261), (140, 0.361), (150, 0.489), (165, 0.838))
+
+
+def _aerobic_rate(avg_hr):
+    """Interpolate the per-minute aerobic rate for an average heart rate."""
+    if avg_hr is None:
+        return 0.0
+    if avg_hr <= _AEROBIC_RATE_BY_HR[0][0]:
+        return _AEROBIC_RATE_BY_HR[0][1]
+    if avg_hr >= _AEROBIC_RATE_BY_HR[-1][0]:
+        return _AEROBIC_RATE_BY_HR[-1][1]
+    for (low_hr, low_rate), (high_hr, high_rate) in zip(_AEROBIC_RATE_BY_HR,
+                                                        _AEROBIC_RATE_BY_HR[1:]):
+        if low_hr <= avg_hr <= high_hr:
+            return low_rate + (high_rate - low_rate) * (avg_hr - low_hr) / (high_hr - low_hr)
+    return _AEROBIC_RATE_BY_HR[-1][1]
+
 # Relative Effort capacity response, in weeks, and the per-week decay applied to
 # the trailing deviation that widens the top of the suggested range.
 CAPACITY_RISE_WEEKS = 6.0
@@ -1761,9 +1783,16 @@ def _map_activity(a):
     # plus Garmin's EPOC-based Training Load ÷ 8, which restores the short
     # hard intervals that zone buckets flatten out. Weights calibrated against
     # Strava Relative Effort over the Aug–Sep 2026 reference weeks.
-    easy_minutes = max(0.0, dur / 60.0 - sum(zones))
-    zone_part = (easy_minutes * 1.2 + sum(
-        minutes * weight for minutes, weight in zip(zones, (2, 4, 8, 14, 22)))) / 10.0
+    if sum(zones) > 0:
+        easy_minutes = max(0.0, dur / 60.0 - sum(zones))
+        zone_part = (easy_minutes * 1.2 + sum(
+            minutes * weight for minutes, weight in zip(zones, (2, 4, 8, 14, 22)))) / 10.0
+    else:
+        # Devices before roughly 2025 recorded no time-in-zone breakdown. Every
+        # minute would otherwise fall to the below-zone-1 floor, scoring a hard
+        # session as if it were a stroll and halving the effort for whole years
+        # of history. Estimate the aerobic term from average heart rate instead.
+        zone_part = dur / 60.0 * _aerobic_rate(avg_hr) if avg_hr else 0.0
     load_part = load / 8.0
     has_hr = avg_hr is not None or sum(zones) > 0
     effort = round(zone_part + load_part, 1) if has_hr else None

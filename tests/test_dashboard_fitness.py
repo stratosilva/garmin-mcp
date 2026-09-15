@@ -56,6 +56,58 @@ class FitnessInputTests(unittest.TestCase):
         self.assertAlmostEqual(series[-1]["fitness"], 10.0, delta=0.5)
 
 
+class MissingZoneDataTests(unittest.TestCase):
+    """Activities recorded before the watch logged time-in-zone.
+
+    Those minutes used to fall to the below-zone-1 floor, scoring a hard hour
+    as if it were a stroll. The rate curve estimates the aerobic term from
+    average heart rate instead; it is fitted to activities that do carry zone
+    minutes and reproduces 95% of their aerobic total on a holdout.
+    """
+
+    def session(self, avg_hr, minutes, zones=None):
+        return dashboard._map_activity({
+            "activityType": {"typeKey": "running"},
+            "duration": minutes * 60, "distance": 0,
+            "averageHR": avg_hr, "activityTrainingLoad": 0,
+            **{f"hrTimeInZone_{i}": (zones[i - 1] * 60 if zones else 0) for i in range(1, 6)},
+        })
+
+    def test_the_rate_climbs_with_heart_rate(self):
+        rates = [dashboard._aerobic_rate(hr) for hr in (95, 110, 125, 140, 155)]
+        self.assertEqual(rates, sorted(rates))
+
+    def test_the_rate_is_flat_outside_the_fitted_range(self):
+        self.assertEqual(dashboard._aerobic_rate(40), dashboard._aerobic_rate(90))
+        self.assertEqual(dashboard._aerobic_rate(200), dashboard._aerobic_rate(165))
+
+    def test_no_heart_rate_and_no_zones_scores_nothing(self):
+        self.assertIsNone(self.session(None, 60)["effort"])
+
+    def test_a_hard_hour_without_zones_is_no_longer_scored_as_a_stroll(self):
+        easy = self.session(95, 60)["effort"]
+        hard = self.session(140, 60)["effort"]
+        self.assertGreater(hard, easy * 2)
+
+    def test_the_estimate_sits_between_the_old_floor_and_an_all_out_hour(self):
+        """The fitted rate is an average over real sessions at that heart rate.
+
+        It must clear the below-zone-1 floor the old code applied, while staying
+        well under a session spent entirely in that zone - a 130 bpm average
+        includes warm-up and recovery minutes, not just tempo ones.
+        """
+        estimated = self.session(130, 60)["effort"]
+        old_floor = 60 * 1.2 / 10.0                    # what the old code scored
+        all_in_zone_three = 60 * 8 / 10.0              # an hour entirely in Z3
+        self.assertGreater(estimated, old_floor)
+        self.assertLess(estimated, all_in_zone_three)
+
+    def test_recorded_zones_still_take_precedence(self):
+        """The estimate must never override a real breakdown."""
+        row = self.session(130, 60, zones=[0, 0, 0, 0, 60])
+        self.assertAlmostEqual(row["effortZonePart"], 60 * 22 / 10.0, delta=0.1)
+
+
 class FitnessWarmupTests(unittest.TestCase):
     def test_the_series_does_not_start_from_a_cold_zero(self):
         """A cold start understates early points and inflates long-period gains."""
