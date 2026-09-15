@@ -1802,6 +1802,11 @@ def _agg(items):
     }
 
 
+# Enough pages to reach 800 days even at several activities a day. Only a
+# safety stop: the loop normally exits as soon as it passes the cutoff.
+HISTORY_ACTIVITY_LIMIT = 4000
+
+
 def _history_activities(client, today):
     """Return two visible years plus a warm-up window for Fitness."""
     # The first Garmin page contains the newest activities. Refresh it on each
@@ -1818,8 +1823,13 @@ def _history_activities(client, today):
             ]
             _HISTORY_CACHE["activities"] = newest + retained
         return _HISTORY_CACHE["activities"]
+    # Page back until the cutoff is genuinely reached. The previous 1000-activity
+    # ceiling was hit long before 800 days for anyone training most days, and it
+    # truncated silently: Fitness then started part-way through the window, so
+    # the oldest points sat near their seed and every long-period percentage was
+    # computed against a value that was too low.
     cutoff, gathered = today - datetime.timedelta(days=800), []
-    for start in range(0, 1000, 100):
+    for start in range(0, HISTORY_ACTIVITY_LIMIT, 100):
         page = _call(client.get_activities, start, 100) or []
         mapped = [_map_activity(activity) for activity in page if isinstance(activity, dict)]
         if not mapped:
@@ -3419,7 +3429,7 @@ function drawFitness(series,days,selectedIndex){
   var selected=selectedIndex==null?rows.length-1:Math.max(0,Math.min(rows.length-1,selectedIndex)),first=rows[0].fitness||0,current=rows[selected].fitness||0,delta=current-first,pct=first>=1?delta/first*100:null,summary=document.getElementById("fit-summary"),value=document.getElementById("fit-value"),period=days===30?'30 days':days===90?'90 days':days===180?'six months':days===365?'year':'two years';
   function fmt(date){return new Date(date+'T00:00:00').toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});}
   if(value)value.textContent=Math.round(current)+' index';
-  if(summary){var pctText=pct==null?'—%':Math.abs(Math.round(pct))+'%',direction=pct==null?'':delta>0?'▲ ':delta<0?'▼ ':'';summary.innerHTML='<span class="change '+(delta>0?'up':'')+'">'+direction+pctText+'</span><span>'+(delta>0?'+':'')+Math.round(delta)+' pts</span><span class="period">'+(selected===rows.length-1?'over the past '+period:'from '+fmt(rows[0].date)+' to '+fmt(rows[selected].date))+'</span>';}
+  if(summary){var pctText=pct==null?'—%':Math.abs(Math.round(pct))+'%',direction=pct==null?'':delta>0?'▲ ':delta<0?'▼ ':'';summary.innerHTML='<span class="change '+(delta>0?'up':'')+'">'+direction+pctText+'</span><span>'+(delta>0?'+':'')+Math.round(delta)+' pts</span><span class="period">'+(selected===rows.length-1?(rows.length<days-3?'over the '+rows.length+' days recorded so far':'over the past '+period):'from '+fmt(rows[0].date)+' to '+fmt(rows[selected].date))+'</span>';}
   var W=1000,H=360,pL=52,pR=18,pT=46,pB=44,vals=[];rows.forEach(function(x){vals.push(x.fitness||0)});var max=Math.max.apply(null,vals.concat([1]))*1.12;
   function X(i){return pL+i*(W-pL-pR)/Math.max(1,rows.length-1)}function Y(v){return pT+(max-v)/max*(H-pT-pB)}function plot(key,color){var d=rows.map(function(x,i){return(i?"L":"M")+X(i).toFixed(1)+" "+Y(x[key]||0).toFixed(1);}).join(" ");var p=document.createElementNS(ns,"path");p.setAttribute("d",d);p.setAttribute("fill","none");p.setAttribute("stroke",color);p.setAttribute("stroke-width",4);p.setAttribute("stroke-linejoin","round");svg.appendChild(p)}
   [0,max/2,max].forEach(function(v){var l=document.createElementNS(ns,"line"),t=document.createElementNS(ns,"text");l.setAttribute("x1",pL);l.setAttribute("x2",W-pR);l.setAttribute("y1",Y(v));l.setAttribute("y2",Y(v));l.setAttribute("stroke",css("--border"));svg.appendChild(l);t.setAttribute("x",pL-10);t.setAttribute("y",Y(v)+5);t.setAttribute("text-anchor","end");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));t.textContent=Math.round(v);svg.appendChild(t)});
