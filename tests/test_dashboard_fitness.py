@@ -105,6 +105,38 @@ class ResponseConstantTests(unittest.TestCase):
     def test_fitness_responds_more_slowly_than_fatigue(self):
         self.assertGreater(dashboard.FITNESS_DAYS, dashboard.FATIGUE_DAYS * 3)
 
+    def test_thirty_day_change_stays_close_to_what_strava_reports(self):
+        """Percentages are the point of this constant, so pin them.
+
+        These are the dashboard's own weekly effort totals for Jun-Sep 2026,
+        alongside the +71% Strava reported over the same 30 days. The constant
+        controls how much the curve is smoothed, and therefore the size of that
+        ratio; at 28 days the same inputs produced +112%.
+        """
+        weekly = [("2026-06-29", 33.8), ("2026-07-06", 54.4), ("2026-07-13", 26.2),
+                  ("2026-07-20", 13.4), ("2026-07-27", 15.0), ("2026-08-03", 27.4),
+                  ("2026-08-10", 59.7), ("2026-08-17", 32.5), ("2026-08-24", 85.5),
+                  ("2026-08-31", 151.6), ("2026-09-07", 67.8), ("2026-09-14", 62.8)]
+        first = datetime.date(2026, 6, 29)
+        warm = 8.0          # daily effort before the window, matched to the live chart
+        daily = {}
+        for start, total in weekly:
+            day = datetime.date.fromisoformat(start)
+            days = [day + datetime.timedelta(days=i) for i in range(7)
+                    if day + datetime.timedelta(days=i) <= TODAY]
+            for d in days:
+                daily[d] = total / len(days)
+
+        fitness, day, month_ago = warm, first - datetime.timedelta(days=240), None
+        while day < TODAY:
+            day += datetime.timedelta(days=1)
+            load = daily.get(day, warm if day < first else 0.0)
+            fitness += (load - fitness) / dashboard.FITNESS_DAYS
+            if day == TODAY - datetime.timedelta(days=30):
+                month_ago = fitness
+        percent = (fitness / month_ago - 1) * 100
+        self.assertAlmostEqual(percent, 71.0, delta=15.0)
+
 
 class FitnessResponseTests(unittest.TestCase):
     def test_fatigue_responds_faster_than_fitness(self):
