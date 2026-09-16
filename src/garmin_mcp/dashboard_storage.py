@@ -252,6 +252,16 @@ class DashboardDatabase:
             """, (activity_id, entry.get("activityName"), entry.get("activityStart"),
                    json.dumps(entry), entry.get("updatedAt")))
 
+    def delete_manual_activity(self, manual_id, kind):
+        tables = {"strength": "dashboard_manual_strength_workouts",
+                  "endurance": "dashboard_manual_endurance_activities"}
+        if kind not in tables:
+            raise ValueError("invalid manual activity type")
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("DELETE FROM " + tables[kind] + " WHERE manual_id = %s", (manual_id,))
+            return cursor.rowcount > 0
+
     def manual_strength_workouts(self):
         self.ensure_schema()
         with self._connect() as connection, connection.cursor() as cursor:

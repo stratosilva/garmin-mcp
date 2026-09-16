@@ -468,6 +468,23 @@ def _save_manual_endurance_activity_unlocked(manual_id, entry):
     _write_strength_log_unlocked(store)
 
 
+def _delete_manual_activity(manual_id, kind):
+    """Delete only the chosen dashboard entry, never a Garmin activity."""
+    if kind not in ("strength", "endurance"):
+        raise ValueError("invalid manual activity type")
+    with _STRENGTH_LOG_LOCK:
+        db = _dashboard_database()
+        if db:
+            return db.delete_manual_activity(manual_id, kind)
+        store = _read_strength_log_unlocked()
+        entries = store["manualWorkouts" if kind == "strength" else "manualActivities"]
+        if manual_id not in entries:
+            return False
+        del entries[manual_id]
+        _write_strength_log_unlocked(store)
+        return True
+
+
 def _strength_text(value, field="exercise", maximum=120):
     if value is None:
         return None
@@ -2446,6 +2463,9 @@ def add_dashboard_routes(asgi_app, client):
     async def manual_strength_workout(request):
         try:
             manual_id = request.path_params.get("manual_id")
+            if request.method == "DELETE":
+                deleted = _delete_manual_activity(manual_id, "strength")
+                return JSONResponse({"deleted": deleted}, status_code=200 if deleted else 404)
             if request.method == "GET":
                 return JSONResponse(_manual_strength_payload(manual_id))
             return JSONResponse(_save_manual_strength_workout(manual_id, await request.json()), status_code=201)
@@ -2458,6 +2478,10 @@ def add_dashboard_routes(asgi_app, client):
             return JSONResponse(_save_manual_strength_workout(manual_id, await request.json()), status_code=201)
         except (ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def delete_manual_endurance_activity(request):
+        deleted = _delete_manual_activity(request.path_params.get("manual_id"), "endurance")
+        return JSONResponse({"deleted": deleted}, status_code=200 if deleted else 404)
 
     async def strength_exercises(_request):
         return JSONResponse({"exercises": _strength_exercise_catalog()})
@@ -2526,8 +2550,9 @@ def add_dashboard_routes(asgi_app, client):
     asgi_app.router.routes.append(Route("/api/strength-activities/{activity_id:int}", strength_activity, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/strength-exercises", strength_exercises, methods=["GET"]))
     asgi_app.router.routes.append(Route("/api/manual-endurance-activities", create_manual_endurance_activity, methods=["POST"]))
+    asgi_app.router.routes.append(Route("/api/manual-endurance-activities/{manual_id}", delete_manual_endurance_activity, methods=["DELETE"]))
     asgi_app.router.routes.append(Route("/api/manual-strength-workouts", create_manual_strength_workout, methods=["POST"]))
-    asgi_app.router.routes.append(Route("/api/manual-strength-workouts/{manual_id}", manual_strength_workout, methods=["GET", "POST"]))
+    asgi_app.router.routes.append(Route("/api/manual-strength-workouts/{manual_id}", manual_strength_workout, methods=["GET", "POST", "DELETE"]))
     asgi_app.router.routes.append(Route("/api/manual-strength-workouts/{manual_id}/candidates", manual_strength_candidates, methods=["GET"]))
     asgi_app.router.routes.append(Route("/api/manual-strength-workouts/{manual_id}/merge", merge_manual_strength_workout, methods=["POST"]))
     asgi_app.router.routes.append(Route("/api/recommendation", recommendation, methods=["POST"]))
@@ -2811,19 +2836,59 @@ function revertGarminStrengthRows(){
   var originalById={};((STRENGTH_STATE.payload||{}).sets||[]).forEach(function(row){originalById[row.id]=row;});document.querySelectorAll("#strength-modal [data-strength-row]").forEach(function(node){var row=originalById[node.dataset.setId]||{};node.querySelector('[data-strength-field="exercise"]').value=row.rawExercise||"";node.querySelector('[data-strength-field="reps"]').value=inputNumber(row.rawReps);node.querySelector('[data-strength-field="durationSeconds"]').value=inputNumber(row.rawDurationSeconds);node.querySelector('[data-strength-field="weightKg"]').value=inputNumber(row.rawWeightKg);node.querySelector('[data-strength-field="perSide"]').checked=false;node.querySelectorAll(".changed").forEach(function(input){input.classList.remove("changed");});var label=node.querySelector("[data-strength-reps-label]");if(label)label.textContent="Reps";});STRENGTH_DIRTY=true;setStrengthStatus("Original Garmin values restored — save to confirm");
 }
 
+var MANUAL_GROUP_SEQUENCE=0;
 function addManualStrengthGroup(){
-  try{STRENGTH_STATE.payload.sets=collectStrengthSets();}catch(error){setStrengthStatus(error.message,true);return;}var key="manual:"+Date.now().toString(36);for(var index=0;index<3;index++)STRENGTH_STATE.payload.sets.push({id:key+":"+index,source:"manual",setType:"ACTIVE",exercise:null,reps:null,durationSeconds:null,weightKg:null,perSide:false});STRENGTH_DIRTY=true;renderStrengthEditor();setStrengthStatus("New three-set exercise added");var groups=document.querySelectorAll("#strength-modal [data-manual-group]");if(groups.length)groups[groups.length-1].scrollIntoView({behavior:"smooth",block:"nearest"});
+  var list=document.querySelector("#strength-modal .strength-manual-list");if(!list)return;
+  var key="manual:"+Date.now().toString(36)+"-"+(++MANUAL_GROUP_SEQUENCE),rows=[];
+  for(var index=0;index<3;index++)rows.push({id:key+":"+index,source:"manual",setType:"ACTIVE",exercise:null,reps:null,durationSeconds:null,weightKg:null,perSide:false});
+  list.insertAdjacentHTML("beforeend",strengthManualGroup(rows,list.querySelectorAll("[data-manual-group]").length));
+  STRENGTH_DIRTY=true;setStrengthStatus("New three-set exercise added");
+  var group=list.lastElementChild;if(group){group.scrollIntoView({behavior:"smooth",block:"nearest"});group.querySelector("[data-manual-exercise]").focus();}
 }
 
-function saveStrengthDetails(){
+async function workoutRequest(endpoint,options){
+  var controller=new AbortController(),timer=setTimeout(function(){controller.abort();},30000);
+  try{
+    var response=await fetch(endpoint,Object.assign({},options,{signal:controller.signal}));
+    var body;try{body=await response.json();}catch(error){throw new Error("The server returned an unreadable response. Please try again.");}
+    if(!response.ok)throw new Error(body.error||"Could not update the workout. Please try again.");
+    return body;
+  }catch(error){if(error.name==="AbortError")throw new Error("The request timed out. Check the dashboard before retrying; your changes remain in this form.");throw error;}
+  finally{clearTimeout(timer);}
+}
+
+async function saveStrengthDetails(){
   if(STRENGTH_STATE&&STRENGTH_STATE.mode==="endurance"){saveManualEnduranceDetails();return;}
-  var button=document.getElementById("strength-save"),sets;try{sets=collectStrengthSets();}catch(error){setStrengthStatus(error.message,true);return;}button.disabled=true;button.textContent="Saving…";setStrengthStatus("Saving details…");var activity=STRENGTH_STATE.activity||{};
-  var manual=STRENGTH_STATE.mode==="manual",payload={activityName:manual?document.getElementById("manual-workout-name").value.trim():activity.name,activityStart:manual?(STRENGTH_STATE.payload.activityStart||new Date().toISOString()):activity.start,sets:sets},endpoint=manual?(STRENGTH_STATE.payload.manualId?"/api/manual-strength-workouts/"+encodeURIComponent(STRENGTH_STATE.payload.manualId):"/api/manual-strength-workouts"):"/api/strength-activities/"+encodeURIComponent(activity.activityId);
-  fetch(endpoint,{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify(payload)})
-    .then(function(response){return response.json().then(function(body){if(!response.ok)throw new Error(body.error||"Could not save strength details");return body;});})
-    .then(function(payload){STRENGTH_STATE.payload=payload;STRENGTH_DIRTY=false;setStrengthStatus("Saved. Updating the dashboard and advice…");setTimeout(function(){var modal=document.getElementById("strength-modal");if(modal)modal.hidden=true;document.body.classList.remove("modal-open");load();},450);})
-    .catch(function(error){setStrengthStatus(error.message,true);})
-    .finally(function(){button.disabled=false;button.textContent="Save details";});
+  var button=document.getElementById("strength-save");if(button.disabled)return;
+  try{
+    var sets=collectStrengthSets(),activity=STRENGTH_STATE.activity||{},manual=STRENGTH_STATE.mode==="manual",nameInput=document.getElementById("manual-workout-name");
+    if(manual&&!nameInput)throw new Error("The workout form could not be read. Close and reopen it, then try again.");
+    var payload={activityName:manual?nameInput.value.trim():activity.name,activityStart:manual?(STRENGTH_STATE.payload.activityStart||new Date().toISOString()):activity.start,sets:sets};
+    var endpoint=manual?(STRENGTH_STATE.payload.manualId?"/api/manual-strength-workouts/"+encodeURIComponent(STRENGTH_STATE.payload.manualId):"/api/manual-strength-workouts"):"/api/strength-activities/"+encodeURIComponent(activity.activityId);
+    button.disabled=true;button.textContent="Saving…";setStrengthStatus("Saving details…");
+    var saved=await workoutRequest(endpoint,{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    STRENGTH_STATE.payload=saved;STRENGTH_DIRTY=false;
+    var modal=document.getElementById("strength-modal");if(modal)modal.hidden=true;
+    document.body.classList.remove("modal-open");load();
+  }catch(error){setStrengthStatus(error.message,true);}
+  finally{button.disabled=false;button.textContent="Save details";}
+}
+
+function manualDeleteButton(activity){
+  var id=activity.manualId||activity.manualEnduranceId;if(!id)return "";
+  var kind=activity.manualId?"strength":"endurance";
+  return '<button type="button" class="strength-remove" data-manual-delete="'+esc(id)+'" data-manual-kind="'+kind+'" data-manual-name="'+esc(activity.name)+'" title="Delete manual workout" aria-label="Delete manual workout"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg></button>';
+}
+
+async function deleteManualWorkout(button){
+  if(button.disabled||!window.confirm('Delete "'+(button.dataset.manualName||"this manual workout")+'"? This removes the manual entry from the dashboard. Garmin activities will not be deleted.'))return;
+  button.disabled=true;
+  try{
+    var endpoint=button.dataset.manualKind==="strength"?"/api/manual-strength-workouts/":"/api/manual-endurance-activities/";
+    await workoutRequest(endpoint+encodeURIComponent(button.dataset.manualDelete),{method:"DELETE",headers:{Authorization:"Bearer "+TOKEN}});
+    load();
+  }catch(error){window.alert(error.message);}
+  finally{button.disabled=false;}
 }
 function chartTip(svg,points,format){
   if(!svg||!points||!points.length)return;var tip=document.getElementById("svg-tip");if(!tip){tip=el("div","svg-tip");tip.id="svg-tip";tip.hidden=true;document.body.appendChild(tip);}
@@ -3186,7 +3251,7 @@ function render(d){
     var col={swim:"var(--swim)",bike:"var(--bike)",run:"var(--run)",walk:"var(--accent)"}[a.sport]||"var(--accent)";
     var r=el("div","act");
     r.innerHTML='<div class="nm"><span class="ic" style="background:color-mix(in srgb,'+col+' 18%,transparent)">'+ic+'</span>'+
-      '<span class="t">'+a.name+'<small>'+(a.start||"").replace("T"," ")+(a.location?" · "+a.location:"")+(a.source?" · source: "+a.source:"")+'</small>'+(a.manualId?'<button type="button" class="strength-open" data-manual-strength-id="'+esc(a.manualId)+'">Edit / merge</button>':(a.isStrength&&a.activityId?'<button type="button" class="strength-open" data-strength-id="'+esc(a.activityId)+'">Edit exercise sets</button>':''))+'</span></div>'+
+      '<span class="t">'+a.name+'<small>'+(a.start||"").replace("T"," ")+(a.location?" · "+a.location:"")+(a.source?" · source: "+a.source:"")+'</small>'+(a.manualId?'<button type="button" class="strength-open" data-manual-strength-id="'+esc(a.manualId)+'">Edit / merge</button>':(a.isStrength&&a.activityId?'<button type="button" class="strength-open" data-strength-id="'+esc(a.activityId)+'">Edit exercise sets</button>':''))+manualDeleteButton(a)+'</span></div>'+
       '<div class="c" data-k="Dist"><b>'+n(a.km)+'</b> km</div>'+
       '<div class="c" data-k="Time"><b>'+n(a.min)+'</b> min</div>'+
       '<div class="c hidesm" data-k="HR"><b>'+n(a.hr)+'</b> bpm</div>'+
@@ -3217,6 +3282,7 @@ function render(d){
   document.getElementById("body-entry-toggle").addEventListener("click",function(){toggleEntry("body-entry");});
   document.getElementById("injury-entry-toggle").addEventListener("click",function(){toggleEntry("injury-entry");});
   document.querySelectorAll("[data-strength-id]").forEach(function(button){button.addEventListener("click",function(){openStrengthEditor(button.dataset.strengthId);});});
+  document.querySelectorAll("[data-manual-delete]").forEach(function(button){button.addEventListener("click",function(){deleteManualWorkout(button);});});
   document.querySelectorAll("[data-manual-strength-new]").forEach(function(button){button.addEventListener("click",function(){openManualStrengthEditor();});});
   document.querySelectorAll("[data-manual-strength-id]").forEach(function(button){button.addEventListener("click",function(){openManualStrengthEditor(button.dataset.manualStrengthId);});});
   document.querySelectorAll("[data-manual-endurance-new]").forEach(function(button){button.addEventListener("click",function(){openManualEnduranceEditor(button.dataset.manualEnduranceNew);});});
