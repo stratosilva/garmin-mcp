@@ -14,6 +14,7 @@ HRV, activity and recovery trends.
 import csv
 import datetime
 import json
+import re
 import os
 import shutil
 import threading
@@ -176,15 +177,19 @@ def _recommendation_snapshot(dashboard):
     wellness = dashboard.get("wellness") or {}
     body = (dashboard.get("body") or {}).get("metrics") or {}
     injuries = (dashboard.get("injuries") or {}).get("records") or []
+    definitions = (dashboard.get("injuries") or {}).get("definitions")
+    injury_fields = tuple(row["id"] for row in definitions if row["enabled"]) if definitions is not None else _INJURY_FIELDS
+    injuries = [{"date": row.get("date"), **{key: row.get(key) for key in injury_fields}} for row in injuries]
+
     recent_activities = dashboard.get("recent") or []
     recent_activities = recent_activities if isinstance(recent_activities, list) else []
     recent_cardio = [row for row in recent_activities
                      if isinstance(row, dict) and not row.get("isStrength") and _cardio_mode(row)]
     muscle_weeks = ((dashboard.get("muscleVolume") or {}).get("weeks") or [])[-2:]
     latest_pain = next((row for row in reversed(injuries)
-                        if any(row.get(field) is not None for field in _INJURY_FIELDS)), None)
+                        if any(row.get(field) is not None for field in injury_fields)), None)
     previous_day_response = _previous_day_pain_response(
-        dashboard.get("date"), injuries, recent_activities, dashboard.get("strength") or {},
+        dashboard.get("date"), injuries, recent_activities, dashboard.get("strength") or {}, injury_fields,
     )
     return {
         "date": dashboard.get("date"),
@@ -226,12 +231,13 @@ def _recommendation_snapshot(dashboard):
         "muscle_stimulus_recent_weeks": muscle_weeks,
         "body_composition": body,
         "pain_latest": latest_pain,
+        "tracked_injuries": [row for row in (definitions or []) if row["enabled"]],
         "pain_trend_14d": injuries[-14:],
         "prior_day_load_and_today_pain": previous_day_response,
     }
 
 
-def _previous_day_pain_response(today_value, injuries, activities, strength):
+def _previous_day_pain_response(today_value, injuries, activities, strength, injury_fields=_INJURY_FIELDS):
     """Summarise yesterday's recorded load beside today's pain, without claiming causation."""
     try:
         today = datetime.date.fromisoformat(str(today_value)[:10])
@@ -261,7 +267,7 @@ def _previous_day_pain_response(today_value, injuries, activities, strength):
             "timedSeconds": activity.get("timedSeconds"), "sets": activity.get("sets") or [],
         })
     changes = {}
-    for field in _INJURY_FIELDS:
+    for field in injury_fields:
         current, previous = today_pain.get(field), (yesterday_pain or {}).get(field)
         if isinstance(current, (int, float)) and isinstance(previous, (int, float)):
             changes[field] = round(current - previous, 1)
@@ -271,8 +277,8 @@ def _previous_day_pain_response(today_value, injuries, activities, strength):
         "activity_date": yesterday.isoformat(), "today_date": today.isoformat(),
         "previous_day_activities": previous_activities,
         "previous_day_strength": previous_strength,
-        "previous_day_pain": {field: (yesterday_pain or {}).get(field) for field in _INJURY_FIELDS},
-        "today_pain": {field: today_pain.get(field) for field in _INJURY_FIELDS},
+        "previous_day_pain": {field: (yesterday_pain or {}).get(field) for field in injury_fields},
+        "today_pain": {field: today_pain.get(field) for field in injury_fields},
         "pain_change_next_day": changes,
         "note": "Association only: assess the full pattern and the athlete's in-session symptoms, not one day alone.",
     }
@@ -1320,79 +1326,143 @@ def _append_body_measurement(payload):
             writer.writerow(row)
 
 
-def _injury_measurements(days=30):
-    """Return a complete recent daily pain series, with missing entries as null."""
-    today = datetime.date.today()
-    start = today - datetime.timedelta(days=days - 1)
-    by_date = {}
-    target = _injury_measurements_path()
-    try:
+_INJURY_LOCK = threading.RLock()
+_INJURY_DEFAULTS = [
+    {"id": "left_big_toe_strain", "name": "Left big toe strain", "color": "#e5484d", "enabled": True},
+    {"id": "left_foot_plantar_fasciitis", "name": "Left foot plantar fasciitis", "color": "#f08c00", "enabled": True},
+    {"id": "right_knee_patellar_tendon", "name": "Right knee patellar tendon", "color": "#1683ff", "enabled": True},
+]
+
+
+def _injury_definitions():
+    db = _dashboard_database()
+    if db:
+        definitions = db.injury_definitions()
+    else:
+        target = _injury_measurements_path().with_suffix(".settings.json")
+        definitions = json.loads(target.read_text(encoding="utf-8")) if target.exists() else None
+    return definitions if definitions is not None else [dict(row) for row in _INJURY_DEFAULTS]
+
+
+def _save_injury_definitions(payload):
+    rows = payload.get("definitions") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 50:
+        raise ValueError("settings must contain between 1 and 50 injuries")
+    with _INJURY_LOCK:
+        known = {row["id"] for row in _injury_definitions()}
+        result, ids, names = [], set(), set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("invalid injury settings")
+            injury_id = row.get("id") or "injury_" + uuid.uuid4().hex
+            if row.get("id") and injury_id not in known:
+                raise ValueError("unknown injury; reload settings before saving")
+            name = _strength_text(row.get("name"), "injury name", 100)
+            color = row.get("color")
+            if not name or name.casefold() in names or injury_id in ids:
+                raise ValueError("give each injury a unique name")
+            if not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+                raise ValueError("choose a valid injury colour")
+            if not isinstance(row.get("enabled"), bool):
+                raise ValueError("enabled must be true or false")
+            ids.add(injury_id); names.add(name.casefold())
+            result.append({"id": injury_id, "name": name, "color": color, "enabled": row["enabled"]})
+        if not known.issubset(ids):
+            raise ValueError("injuries cannot be removed; disable them to preserve history")
         db = _dashboard_database()
         if db:
-            for values in db.injury_measurements(start, today):
-                by_date[values[0]] = dict(zip(_INJURY_FIELDS, values[1:]))
-        elif target.exists():
-            with target.open(newline="", encoding="utf-8") as handle:
-                for row in csv.DictReader(handle):
-                    try:
-                        date = datetime.date.fromisoformat((row.get("date") or "")[:10])
-                    except ValueError:
-                        continue
-                    if date < start or date > today:
-                        continue
+            db.save_injury_definitions(result)
+        else:
+            target = _injury_measurements_path().with_suffix(".settings.json")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_suffix(".tmp")
+            temporary.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(target)
+        return result
+
+
+def _injury_measurements(days=30):
+    """Return definitions and retained history, including disabled injuries."""
+    today = datetime.date.today()
+    start = today - datetime.timedelta(days=days - 1)
+    definitions = _injury_definitions()
+    fields = [row["id"] for row in definitions]
+    by_date = {}
+    target = _injury_measurements_path()
+    db = _dashboard_database()
+    if db:
+        for values in db.injury_measurements(start, today):
+            by_date[values[0]] = dict(zip(_INJURY_FIELDS, values[1:]))
+        for date, scores in db.injury_scores(start, today):
+            by_date.setdefault(date, {}).update(scores)
+    elif target.exists():
+        with target.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    date = datetime.date.fromisoformat((row.get("date") or "")[:10])
+                except ValueError:
+                    continue
+                if start <= date <= today:
                     values = {}
-                    for field in _INJURY_FIELDS:
+                    for field in fields:
                         try:
-                            value = row.get(field)
-                            values[field] = float(value) if value not in (None, "") else None
+                            values[field] = float(row[field]) if row.get(field) not in (None, "") else None
                         except ValueError:
                             values[field] = None
                     by_date[date] = values
-    except OSError:
-        pass
-    return {"records": [
+    return {"definitions": definitions, "records": [
         {"date": (start + datetime.timedelta(days=offset)).isoformat(), **by_date.get(start + datetime.timedelta(days=offset), {})}
         for offset in range(days)
     ]}
 
 
 def _append_injury_measurement(payload):
-    """Validate and upsert today's three Numeric Rating Scale pain values."""
-    date = payload.get("date") or datetime.date.today().isoformat()
+    """Update enabled injuries while retaining disabled scores on the same day."""
+    if not isinstance(payload, dict):
+        raise ValueError("pain scores must be an object")
     try:
-        parsed_date = datetime.date.fromisoformat(str(date)[:10])
-    except (TypeError, ValueError) as exc:
+        date = datetime.date.fromisoformat(str(payload.get("date") or datetime.date.today().isoformat()))
+    except ValueError as exc:
         raise ValueError("date must be YYYY-MM-DD") from exc
-    if parsed_date > datetime.date.today():
+    if date > datetime.date.today():
         raise ValueError("pain measurements cannot be entered for a future day")
-    row = {"date": parsed_date.isoformat()}
-    for field in _INJURY_FIELDS:
-        try:
-            value = float(payload[field])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("enter a whole-number pain score from 0 to 10 for each injury") from exc
-        if not value.is_integer() or not 0 <= value <= 10:
-            raise ValueError("pain scores must be whole numbers from 0 to 10")
-        row[field] = int(value)
-
-    db = _dashboard_database()
-    if db:
-        db.upsert_injury_measurement(row)
-        return
-    target = _injury_measurements_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    existing = []
-    try:
+    with _INJURY_LOCK:
+        fields = [row["id"] for row in _injury_definitions() if row["enabled"]]
+        if not fields:
+            raise ValueError("enable an injury in settings before adding scores")
+        if set(payload) - {"date", *fields}:
+            raise ValueError("injury settings changed; reload the score form")
+        scores = {}
+        for field in fields:
+            try:
+                value = float(payload[field])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("enter a whole-number pain score from 0 to 10 for each enabled injury") from exc
+            if not value.is_integer() or not 0 <= value <= 10:
+                raise ValueError("pain scores must be whole numbers from 0 to 10")
+            scores[field] = int(value)
+        db = _dashboard_database()
+        if db:
+            db.upsert_injury_scores(date, scores)
+            return
+        target = _injury_measurements_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existing, columns = [], ["date", *_INJURY_FIELDS]
         if target.exists():
             with target.open(newline="", encoding="utf-8") as handle:
-                existing = [old for old in csv.DictReader(handle) if old.get("date") != row["date"]]
-    except OSError as exc:
-        raise ValueError("could not read the injury log") from exc
-    existing.append(row)
-    with target.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("date", *_INJURY_FIELDS))
-        writer.writeheader()
-        writer.writerows(existing)
+                reader = csv.DictReader(handle)
+                columns = list(dict.fromkeys(columns + (reader.fieldnames or [])))
+                existing = list(reader)
+        row = next((old for old in existing if old.get("date") == date.isoformat()), None)
+        if row is None:
+            row = {"date": date.isoformat()}; existing.append(row)
+        row.update(scores)
+        columns = list(dict.fromkeys(columns + list(scores)))
+        temporary = target.with_suffix(".tmp")
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader(); writer.writerows(existing)
+        temporary.replace(target)
 
 
 # --------------------------------------------------------------------------- #
@@ -2439,6 +2509,18 @@ def add_dashboard_routes(asgi_app, client):
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(_body_measurements(), status_code=201)
 
+    async def injury_settings(request):
+        try:
+            definitions = _save_injury_definitions(await request.json()) if request.method == "POST" else _injury_definitions()
+            if request.method == "POST":
+                try:
+                    _recommendation_cache_path().unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return JSONResponse({"definitions": definitions})
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
     async def injury_measurements(request):
         if request.method == "GET":
             return JSONResponse(_injury_measurements())
@@ -2549,6 +2631,7 @@ def add_dashboard_routes(asgi_app, client):
 
     asgi_app.router.routes.append(Route("/api/dashboard", api, methods=["GET"]))
     asgi_app.router.routes.append(Route("/api/body-measurements", body_measurements, methods=["GET", "POST"]))
+    asgi_app.router.routes.append(Route("/api/injury-settings", injury_settings, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/injury-measurements", injury_measurements, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/strength-activities/{activity_id:int}", strength_activity, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/strength-exercises", strength_exercises, methods=["GET"]))
@@ -2697,6 +2780,7 @@ button.rf svg{width:15px;height:15px}
 .contrib-bar i.optimal{background:var(--good)}.contrib-bar i.good{background:var(--accent)}.contrib-bar i.attention{background:var(--warn)}
 .contrib-note{display:block;margin-top:4px;font-size:11px;color:var(--faint)}
 .entry-actions{display:flex;justify-content:flex-end;margin-top:14px}.entry-form{display:none;margin-top:14px;padding:15px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2)}.entry-form.open{display:block}.entry-fields{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.injury-fields{grid-template-columns:repeat(3,1fr)}.entry-fields label{display:grid;gap:4px;font-size:12px;font-weight:700;color:var(--muted)}.entry-fields input,.entry-fields select{width:100%;border:1px solid var(--border);border-radius:9px;padding:9px;background:var(--surface);color:var(--text);font:inherit}.entry-submit{margin-top:12px;border:0;border-radius:999px;background:var(--accent);color:white;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer}.entry-status{margin:9px 0 0;font-size:12px;color:var(--muted)}.injurychart{width:100%;height:300px;display:block;margin-top:10px}.painlegend{display:flex;flex-wrap:wrap;gap:7px 14px;margin-top:12px;font-size:12px;color:var(--muted)}.painlegend span{display:flex;align-items:center;gap:5px}.painlegend i{width:9px;height:9px;border-radius:50%;display:inline-block}.pain-scale{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
+.injury-settings-dialog{width:min(720px,94vw);max-height:85vh;overflow:auto;border:1px solid var(--border);border-radius:18px;padding:24px;background:var(--surface);color:var(--text)}.injury-settings-dialog::backdrop{background:rgba(0,0,0,.45)}.injury-setting{display:grid;grid-template-columns:minmax(140px,1fr) 72px auto;gap:12px;align-items:center;padding:14px 0;border-bottom:1px solid var(--border);margin-bottom:12px}.injury-setting [data-injury-state]{grid-column:1/-1;justify-self:start}.injury-settings-dialog .entry-actions{gap:10px}.injury-settings-dialog p{color:var(--muted)}
 @media(max-width:640px){.entry-fields,.injury-fields{grid-template-columns:1fr 1fr}.injurychart{height:240px}.primarychart{height:250px}.loadchart text,.effortdaily text{font-size:21px!important}}@media(max-width:420px){.entry-fields,.injury-fields{grid-template-columns:1fr}}
 .strength-open{display:inline-flex;align-items:center;margin-top:5px;border:0;background:transparent;color:var(--accent);padding:2px 0;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer}.strength-card-action{margin-top:12px;width:100%;justify-content:center!important;box-shadow:none!important;background:var(--surface-2)!important}
 .strength-modal[hidden]{display:none}.strength-modal{position:fixed;inset:0;z-index:50;background:rgba(5,12,22,.64);display:grid;place-items:center;padding:18px}.strength-dialog{width:min(720px,100%);max-height:calc(100dvh - 36px);display:flex;flex-direction:column;background:var(--bg);border:1px solid var(--border);border-radius:20px;box-shadow:0 24px 70px rgba(0,0,0,.35);overflow:hidden}.strength-dialog-head,.strength-dialog-foot{background:var(--surface);padding:14px 17px;display:flex;align-items:center;justify-content:space-between;gap:12px}.strength-dialog-head{border-bottom:1px solid var(--border)}.strength-dialog-head h2{font-size:18px;margin:0}.strength-dialog-head p{font-size:12px;color:var(--muted);margin:2px 0 0}.strength-dialog-foot{border-top:1px solid var(--border);justify-content:flex-end}.strength-dialog-body{padding:14px;overflow:auto;overscroll-behavior:contain}.strength-close{width:44px;height:44px;border:1px solid var(--border);border-radius:50%;background:var(--surface-2);color:var(--text);font-size:22px;cursor:pointer}.strength-save{border:0;border-radius:999px;background:var(--accent);color:#fff;padding:10px 16px;min-height:44px;font:inherit;font-weight:700;cursor:pointer}.strength-save:disabled{opacity:.65;cursor:wait}.strength-banner{padding:10px 12px;border-radius:11px;background:color-mix(in srgb,var(--accent) 12%,var(--surface));color:var(--muted);font-size:12.5px;margin-bottom:12px}.strength-banner.warn{background:color-mix(in srgb,var(--warn) 13%,var(--surface));color:var(--warn)}.strength-editor-title{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:17px 2px 8px}.strength-editor-title:first-child{margin-top:0}.strength-editor-title h3{margin:0;font-size:14px}.strength-editor-title p{margin:2px 0 0;font-size:11.5px;color:var(--muted)}.strength-set-list,.strength-manual-list{display:grid;gap:8px}.strength-set-row,.strength-manual-group{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:11px}.strength-set-meta,.strength-manual-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.strength-set-meta b,.strength-manual-head b{font-size:12.5px}.strength-set-meta span,.strength-manual-head span{font-size:11px;color:var(--muted)}.strength-fields{display:grid;grid-template-columns:minmax(170px,1fr) 78px 82px 92px;gap:8px;align-items:end}.strength-field{display:grid;gap:4px;min-width:0;color:var(--muted);font-size:11px;font-weight:700}.strength-field input{width:100%;min-width:0;border:1px solid var(--border);border-radius:9px;padding:9px;background:var(--surface-2);color:var(--text);font:inherit;font-size:16px}.strength-field input.changed{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 7%,var(--surface))}.strength-row-actions{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:8px}.strength-per-side{display:flex;align-items:center;gap:7px;min-height:36px;font-size:12px;color:var(--muted);cursor:pointer}.strength-per-side input{width:18px;height:18px}.strength-apply,.strength-add,.strength-remove,.strength-copy{border:1px solid var(--border);border-radius:999px;background:var(--surface-2);color:var(--text);padding:7px 10px;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer}.strength-add{min-height:40px}.strength-remove{border-color:transparent;background:transparent;color:var(--low)}.strength-original{font-size:11px;color:var(--faint);margin:6px 0 0}.strength-manual-sets{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.strength-manual-pair{min-width:0;padding:8px;border-radius:10px;background:var(--surface-2)}.strength-manual-set-head{display:flex;align-items:center;justify-content:space-between;gap:5px;margin-bottom:6px;font-size:11px}.strength-copy{padding:4px 7px;border-color:transparent;background:var(--surface);font-size:10px}.strength-manual-values{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.strength-manual-values .strength-field input{padding:8px 6px;background:var(--surface)}.strength-status{min-height:18px;margin:9px 2px 0;color:var(--muted);font-size:12px}.strength-empty{padding:18px;text-align:center;color:var(--muted);font-size:13px;background:var(--surface);border:1px dashed var(--border);border-radius:13px}.modal-open{overflow:hidden}
@@ -3000,15 +3084,49 @@ function saveEntry(endpoint,formId,statusId){
     .then(function(){status.textContent="Saved. Refreshing dashboard…";load();})
     .catch(function(error){status.textContent=error.message;});
 }
-function drawInjuries(records){
+function fillInjuryScores(){
+  var form=document.getElementById("injury-entry"),date=form.elements.namedItem("date").value;
+  var row=(((CURRENT_DASHBOARD||{}).injuries||{}).records||[]).find(function(item){return item.date===date;})||{};
+  form.querySelectorAll('input[type="number"]').forEach(function(input){input.value=row[input.name]==null?"":row[input.name];});
+}
+
+function injurySettingsRow(item){
+  return '<div class="injury-setting" data-injury-id="'+esc(item.id||"")+'"><label class="strength-field">Injury name<input data-injury-name maxlength="100" value="'+esc(item.name||"")+'" required></label><label class="strength-field">Colour<input data-injury-color type="color" value="'+esc(item.color||"#8b5cf6")+'"></label><label><input data-injury-enabled type="checkbox" '+(item.enabled?'checked':'')+'> Enabled</label><span data-injury-state class="pill '+(item.enabled?'good':'mute')+'">'+(item.enabled?'Active':'Disabled · history kept')+'</span></div>';
+}
+
+function openInjurySettings(){
+  var dialog=document.getElementById("injury-settings");
+  if(!dialog){
+    dialog=document.createElement("dialog");dialog.id="injury-settings";dialog.className="injury-settings-dialog";
+    dialog.innerHTML='<form id="injury-settings-form"><h2>Injury settings</h2><p>Disable an injury to hide it from the graph, daily form and current advice. All past scores stay saved and return when you re-enable it.</p><div id="injury-settings-list"></div><button type="button" class="rf" id="injury-settings-add">+ Add injury</button><p class="entry-status" id="injury-settings-status" aria-live="polite"></p><div class="entry-actions"><button type="button" class="rf" id="injury-settings-cancel">Cancel</button><button type="submit" class="entry-submit" id="injury-settings-save">Save settings</button></div></form>';
+    document.body.appendChild(dialog);
+    var form=dialog.querySelector("form");
+    function cancel(event){if(dialog.dataset.busy==="true"){if(event)event.preventDefault();return;}if(dialog.dataset.dirty==="true"&&!window.confirm("Discard unsaved injury settings?")){if(event)event.preventDefault();return;}dialog.close();}
+    dialog.addEventListener("cancel",cancel);document.getElementById("injury-settings-cancel").addEventListener("click",function(){cancel();});
+    form.addEventListener("input",function(event){dialog.dataset.dirty="true";if(event.target.matches("[data-injury-enabled]")){var badge=event.target.closest(".injury-setting").querySelector("[data-injury-state]");badge.textContent=event.target.checked?"Active":"Disabled · history kept";badge.className="pill "+(event.target.checked?"good":"mute");}});
+    document.getElementById("injury-settings-add").addEventListener("click",function(){var list=document.getElementById("injury-settings-list");list.insertAdjacentHTML("beforeend",injurySettingsRow({enabled:true}));dialog.dataset.dirty="true";list.lastElementChild.querySelector("[data-injury-name]").focus();});
+    form.addEventListener("submit",async function(event){
+      event.preventDefault();if(dialog.dataset.busy==="true")return;
+      var definitions=Array.from(form.querySelectorAll(".injury-setting")).map(function(row){return {id:row.dataset.injuryId||null,name:row.querySelector("[data-injury-name]").value.trim(),color:row.querySelector("[data-injury-color]").value,enabled:row.querySelector("[data-injury-enabled]").checked};});
+      var button=document.getElementById("injury-settings-save"),status=document.getElementById("injury-settings-status");dialog.dataset.busy="true";form.querySelectorAll("input,button").forEach(function(control){control.disabled=true;});status.textContent="Saving…";
+      try{await workoutRequest("/api/injury-settings",{method:"POST",headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({definitions:definitions})});dialog.dataset.dirty="false";dialog.close();load();}
+      catch(error){status.textContent=error.message;}
+      finally{dialog.dataset.busy="false";form.querySelectorAll("input,button").forEach(function(control){control.disabled=false;});}
+    });
+  }
+  document.getElementById("injury-settings-list").innerHTML=(((CURRENT_DASHBOARD||{}).injuries||{}).definitions||[]).map(injurySettingsRow).join("");
+  document.getElementById("injury-settings-status").textContent="";dialog.dataset.dirty="false";dialog.dataset.busy="false";dialog.showModal();
+}
+
+function drawInjuries(records,definitions){
   var svg=document.getElementById("injuryc");if(!svg)return;svg.innerHTML="";records=records||[];if(!records.length)return;
   var W=1000,H=300,pL=44,pR=18,pT=16,pB=42,plotW=W-pL-pR,plotH=H-pT-pB;
   function X(i){return pL+i*plotW/Math.max(1,records.length-1);}function Y(v){return pT+(10-v)/10*plotH;}
   [0,2,4,6,8,10].forEach(function(v){var y=Y(v),line=document.createElementNS(ns,"line"),text=document.createElementNS(ns,"text");line.setAttribute("x1",pL);line.setAttribute("x2",W-pR);line.setAttribute("y1",y);line.setAttribute("y2",y);line.setAttribute("stroke",css("--border"));svg.appendChild(line);text.setAttribute("x",pL-10);text.setAttribute("y",y+5);text.setAttribute("text-anchor","end");text.setAttribute("font-size",15);text.setAttribute("fill",css("--faint"));text.textContent=v;svg.appendChild(text);});
   [0,7,14,21,29].filter(function(i){return i<records.length;}).forEach(function(i){var date=new Date(records[i].date+"T00:00:00"),text=document.createElementNS(ns,"text");text.setAttribute("x",X(i));text.setAttribute("y",H-12);text.setAttribute("text-anchor","middle");text.setAttribute("font-size",14);text.setAttribute("fill",css("--faint"));text.textContent=(date.getMonth()+1)+"/"+date.getDate();svg.appendChild(text);});
-  var series=[{key:"left_big_toe_strain",color:"#e5484d"},{key:"left_foot_plantar_fasciitis",color:"#f08c00"},{key:"right_knee_patellar_tendon",color:"#1683ff"}];
+  var series=(definitions||[]).filter(function(item){return item.enabled;}).map(function(item){return {key:item.id,color:item.color,name:item.name};});
   series.forEach(function(s){var points=records.map(function(row,i){return row[s.key]==null?null:{x:X(i),y:Y(row[s.key])};}).filter(Boolean);if(!points.length)return;var path=document.createElementNS(ns,"path");path.setAttribute("d",points.map(function(point,i){return(i?"L":"M")+point.x.toFixed(1)+" "+point.y.toFixed(1);}).join(" "));path.setAttribute("fill","none");path.setAttribute("stroke",s.color);path.setAttribute("stroke-width",4);path.setAttribute("stroke-linecap","round");path.setAttribute("stroke-linejoin","round");svg.appendChild(path);points.forEach(function(point){var dot=document.createElementNS(ns,"circle");dot.setAttribute("cx",point.x);dot.setAttribute("cy",point.y);dot.setAttribute("r",6);dot.setAttribute("fill",css("--surface"));dot.setAttribute("stroke",s.color);dot.setAttribute("stroke-width",3);svg.appendChild(dot);});});
-  chartTip(svg,records,function(row){var fmt=function(v){return v==null?"—":v+" / 10";};return "<b>"+new Date(row.date+"T00:00:00").toLocaleDateString(undefined,{month:"short",day:"numeric"})+"</b><br>Left big toe: "+fmt(row.left_big_toe_strain)+"<br>Left plantar fascia: "+fmt(row.left_foot_plantar_fasciitis)+"<br>Right patellar tendon: "+fmt(row.right_knee_patellar_tendon);});
+  chartTip(svg,records,function(row){return "<b>"+esc(row.date)+"</b>"+series.map(function(item){return "<br>"+esc(item.name)+": "+(row[item.key]==null?"—":row[item.key]+" / 10");}).join("");});
 }
 
 function loadPersonalRecommendation(d,refresh){
@@ -3243,7 +3361,8 @@ function render(d){
   // daily injury tracking uses the standard 0–10 Numeric Rating Scale (NRS-11)
   app.appendChild(sec("Injuries"));
   var injury=el("div","card");
-  injury.innerHTML='<div class="label"><p class="eyebrow">Pain trend · last 30 days</p><span class="pill mute">0–10 NRS</span></div><svg class="injurychart" id="injuryc" viewBox="0 0 1000 300" preserveAspectRatio="none"></svg><div class="painlegend"><span><i style="background:#e5484d"></i>Left big toe strain</span><span><i style="background:#f08c00"></i>Left foot plantar fasciitis</span><span><i style="background:#1683ff"></i>Right knee patellar tendon</span></div><div class="pain-scale"><b>Numeric Rating Scale (NRS-11):</b> 0 = no pain · 1–3 = mild · 4–6 = moderate · 7–10 = severe / worst pain imaginable.</div><div class="entry-actions"><button class="rf" id="injury-entry-toggle">Add today’s pain scores</button></div><form class="entry-form" id="injury-entry"><div class="entry-fields injury-fields"><label>Left big toe strain (0–10)<input name="left_big_toe_strain" type="number" min="0" max="10" step="1" required></label><label>Left plantar fasciitis (0–10)<input name="left_foot_plantar_fasciitis" type="number" min="0" max="10" step="1" required></label><label>Right patellar tendon (0–10)<input name="right_knee_patellar_tendon" type="number" min="0" max="10" step="1" required></label></div><button class="entry-submit" type="submit">Save today’s scores</button><p class="entry-status" id="injury-entry-status"></p></form>';
+  var injuryData=d.injuries||{},activeInjuries=(injuryData.definitions||[]).filter(function(item){return item.enabled;});
+  injury.innerHTML='<div class="label"><p class="eyebrow">Pain trend · last 30 days</p><button type="button" class="rf" id="injury-settings-open" aria-label="Injury settings">⚙ Settings</button></div><svg class="injurychart" id="injuryc" viewBox="0 0 1000 300" preserveAspectRatio="none"></svg><div class="painlegend">'+activeInjuries.map(function(item){return '<span><i style="background:'+esc(item.color)+'"></i>'+esc(item.name)+'</span>';}).join("")+'</div>'+(!activeInjuries.length?'<p>No active injuries. Open Settings to add or re-enable one. Your previous scores are retained.</p>':'')+'<div class="pain-scale"><b>Numeric Rating Scale (NRS-11):</b> 0 = no pain · 1–3 = mild · 4–6 = moderate · 7–10 = severe / worst pain imaginable.</div><div class="entry-actions"><button class="rf" id="injury-entry-toggle" '+(!activeInjuries.length?'disabled':'')+'>Add / edit pain scores</button></div><form class="entry-form" id="injury-entry"><label class="strength-field">Date<input type="date" name="date" id="injury-score-date" min="'+esc(((injuryData.records||[])[0]||{}).date||d.date)+'" value="'+esc(d.date)+'" max="'+esc(d.date)+'" required></label><div class="entry-fields injury-fields">'+activeInjuries.map(function(item){return '<label>'+esc(item.name)+' (0–10)<input name="'+esc(item.id)+'" type="number" min="0" max="10" step="1" required></label>';}).join("")+'</div><button class="entry-submit" type="submit" '+(!activeInjuries.length?'disabled':'')+'>Save scores</button><p class="entry-status" id="injury-entry-status"></p></form>';
   app.appendChild(injury);
 
   // recent activities
@@ -3280,7 +3399,10 @@ function render(d){
   drawTiming((rec.nights||[]).slice(-14));
   drawEffort(re);
   drawFitness(fs,30);
-  drawInjuries((d.injuries||{}).records||[]);
+  drawInjuries((d.injuries||{}).records||[],(d.injuries||{}).definitions||[]);
+  fillInjuryScores();
+  document.getElementById("injury-score-date").addEventListener("change",fillInjuryScores);
+  document.getElementById("injury-settings-open").addEventListener("click",openInjurySettings);
   document.querySelectorAll("#fit-tabs button").forEach(function(button){button.addEventListener("click",function(){document.querySelectorAll("#fit-tabs button").forEach(function(x){x.classList.remove("active")});button.classList.add("active");drawFitness(fs,Number(button.dataset.days),null);});});
   document.getElementById("rf").addEventListener("click",load);
   document.getElementById("body-entry-toggle").addEventListener("click",function(){toggleEntry("body-entry");});

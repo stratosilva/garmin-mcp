@@ -99,6 +99,18 @@ class DashboardDatabase:
                         details JSONB NOT NULL DEFAULT '{}'::jsonb
                     )
                 """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS dashboard_injury_settings (
+                        singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+                        definitions JSONB NOT NULL
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS dashboard_injury_scores (
+                        measured_on DATE PRIMARY KEY,
+                        scores JSONB NOT NULL
+                    )
+                """)
             self._ready = True
 
     def _migration_done(self, cursor, key):
@@ -204,6 +216,32 @@ class DashboardDatabase:
             """, (row["timestamp"], value("weight_kg"), value("fat_pct"),
                    value("muscle_pct"), value("bone_pct"),
                    value("body_water_pct"), row["source"]))
+
+    def injury_definitions(self):
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT definitions FROM dashboard_injury_settings WHERE singleton = TRUE")
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+    def save_injury_definitions(self, definitions):
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("INSERT INTO dashboard_injury_settings (singleton, definitions) VALUES (TRUE, %s::jsonb) "
+                           "ON CONFLICT (singleton) DO UPDATE SET definitions = EXCLUDED.definitions", (json.dumps(definitions),))
+
+    def injury_scores(self, start, end):
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT measured_on, scores FROM dashboard_injury_scores WHERE measured_on BETWEEN %s AND %s", (start, end))
+            return cursor.fetchall()
+
+    def upsert_injury_scores(self, date, scores):
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("INSERT INTO dashboard_injury_scores (measured_on, scores) VALUES (%s, %s::jsonb) "
+                           "ON CONFLICT (measured_on) DO UPDATE SET scores = dashboard_injury_scores.scores || EXCLUDED.scores",
+                           (date, json.dumps(scores)))
 
     def injury_measurements(self, start, end):
         self.ensure_schema()
