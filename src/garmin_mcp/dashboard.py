@@ -1882,13 +1882,13 @@ def _history_activities(client, today):
 # Fitness-only calibration from paired activity/weekly Strava readings (Sep 2026).
 # These are empirical coefficients, not Strava's published formula. Preserve
 # the existing Relative Effort scores and capacity band; only Fitness receives
-# this intensity adjustment and the agreed 20% scale increase.
+# this intensity adjustment and the agreed 20.3% scale increase.
 FITNESS_DAYS = 42.0
 FATIGUE_DAYS = 7.0
 FITNESS_SEED_DAYS = 42
 FITNESS_BASE_WEIGHT = 0.8481948641500818
 FITNESS_INTENSITY_WEIGHT = 0.8276011107352337
-FITNESS_SCALE = 1.2
+FITNESS_SCALE = 1.203  # small refinement against the Sep 16, 2026 reference
 
 
 def _fitness_effort(activity, effort):
@@ -3079,7 +3079,7 @@ function render(d){
   response.appendChild(effortCard);
   var fitnessCard=el("div","card");
   var fs=d.fitnessSeries||[],latest=fs[fs.length-1]||{};
-  fitnessCard.innerHTML='<div class="label"><p class="eyebrow">Fitness level · effort model</p><span class="pill good" id="fit-value">'+n(latest.fitness)+' index</span></div><div class="charttabs" id="fit-tabs"><button data-days="30" class="active">1 month</button><button data-days="90">3 months</button><button data-days="180">6 months</button><button data-days="365">1 year</button><button data-days="731">2 years</button></div><div class="fitsummary" id="fit-summary"></div><svg class="loadchart primarychart" id="fitnessc" viewBox="0 0 1000 360" preserveAspectRatio="none"></svg><div class="metricnote">A 42-day average calibrated to your Strava reference readings, with extra weight for harder activity. Fitness builds with training and decays with rest. Comparisons use calendar periods; Relative Effort scores are unchanged. The badge shows the selected day’s level; click any point to compare it with the first day of the period, or leave it on today.</div>';
+  fitnessCard.innerHTML='<div class="label"><p class="eyebrow">Fitness level · effort model</p><span class="pill good" id="fit-value">'+n(latest.fitness)+' index</span></div><div class="charttabs" id="fit-tabs"><button data-days="30" class="active">1 month</button><button data-days="90">3 months</button><button data-days="180">6 months</button><button data-days="365">1 year</button><button data-days="731">2 years</button></div><div class="fitsummary" id="fit-summary"></div><svg class="loadchart primarychart" id="fitnessc" viewBox="0 0 1000 360" preserveAspectRatio="none"></svg><div class="metricnote">A 42-day average calibrated to your Strava reference readings, with extra weight for harder activity. Fitness builds with training and decays with rest. Comparisons use calendar periods and whole-number scores; the line shows smaller daily changes. Relative Effort scores are unchanged. The badge shows the selected day’s level; click any point to compare it with the first day of the period, or leave it on today.</div>';
   response.appendChild(fitnessCard);app.appendChild(response);
 
   // readiness contributors + sleep detail
@@ -3481,11 +3481,18 @@ function fitnessWindow(series,days){
   return series.filter(function(row){return row.date>=cutoff;});
 }
 
+// The curve retains decimal precision. Summary changes use the same whole
+// scores as the badges, so small movements within one score do not change them.
+function fitnessSummary(first,current){
+  var startScore=Math.round(first),score=Math.round(current),delta=score-startScore;
+  return {score:score,delta:delta,pct:startScore>0?Math.round(delta/startScore*100):null};
+}
+
 function drawFitness(series,days,selectedIndex){
   var svg=document.getElementById("fitnessc");if(!svg)return;svg.innerHTML="";var rows=fitnessWindow(series,days);if(!rows.length)return;
-  var selected=selectedIndex==null?rows.length-1:Math.max(0,Math.min(rows.length-1,selectedIndex)),first=rows[0].fitness||0,current=rows[selected].fitness||0,delta=current-first,pct=first>=1?delta/first*100:null,summary=document.getElementById("fit-summary"),value=document.getElementById("fit-value"),period=days===30?'month':days===90?'three months':days===180?'six months':days===365?'year':'two years';
+  var selected=selectedIndex==null?rows.length-1:Math.max(0,Math.min(rows.length-1,selectedIndex)),first=rows[0].fitness||0,current=rows[selected].fitness||0,change=fitnessSummary(first,current),delta=change.delta,pct=change.pct,summary=document.getElementById("fit-summary"),value=document.getElementById("fit-value"),period=days===30?'month':days===90?'three months':days===180?'six months':days===365?'year':'two years';
   function fmt(date){return new Date(date+'T00:00:00').toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});}
-  if(value)value.textContent=Math.round(current)+' index';
+  if(value)value.textContent=change.score+' index';
   if(summary){var pctText=pct==null?'—%':Math.abs(Math.round(pct))+'%',direction=pct==null?'':delta>0?'▲ ':delta<0?'▼ ':'';summary.innerHTML='<span class="change '+(delta>0?'up':'')+'">'+direction+pctText+'</span><span>'+(delta>0?'+':'')+Math.round(delta)+' pts</span><span class="period">'+(selected===rows.length-1?(rows.length<days-3?'over the '+rows.length+' days recorded so far':'over the past '+period):'from '+fmt(rows[0].date)+' to '+fmt(rows[selected].date))+'</span>';}
   var W=1000,H=360,pL=52,pR=18,pT=46,pB=44,vals=[];rows.forEach(function(x){vals.push(x.fitness||0)});var max=Math.max.apply(null,vals.concat([1]))*1.12;
   function X(i){return pL+i*(W-pL-pR)/Math.max(1,rows.length-1)}function Y(v){return pT+(max-v)/max*(H-pT-pB)}function plot(key,color){var d=rows.map(function(x,i){return(i?"L":"M")+X(i).toFixed(1)+" "+Y(x[key]||0).toFixed(1);}).join(" ");var p=document.createElementNS(ns,"path");p.setAttribute("d",d);p.setAttribute("fill","none");p.setAttribute("stroke",color);p.setAttribute("stroke-width",4);p.setAttribute("stroke-linejoin","round");svg.appendChild(p)}
@@ -3495,7 +3502,7 @@ function drawFitness(series,days,selectedIndex){
   // The selected day's value sits in a badge on top of its marker, the way
   // Strava labels the current day, so the number is readable without hovering.
   (function(){
-    var label=String(Math.round(current)),bw=Math.max(56,label.length*17+26),bh=34;
+    var label=String(change.score),bw=Math.max(56,label.length*17+26),bh=34;
     var bx=Math.max(pL,Math.min(W-pR-bw,X(selected)-bw/2));
     var box=document.createElementNS(ns,"rect");
     box.setAttribute("x",bx);box.setAttribute("y",2);box.setAttribute("width",bw);box.setAttribute("height",bh);

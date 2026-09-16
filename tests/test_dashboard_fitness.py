@@ -164,7 +164,7 @@ class ResponseConstantTests(unittest.TestCase):
         with patch.object(dashboard, "FITNESS_SCALE", 1.0):
             unscaled = dashboard._training_history(activities, TODAY)
         for index in (-1, -32):
-            self.assertAlmostEqual(scaled[index]["fitness"], unscaled[index]["fitness"] * 1.2, places=5)
+            self.assertAlmostEqual(scaled[index]["fitness"], unscaled[index]["fitness"] * dashboard.FITNESS_SCALE, places=5)
         self.assertAlmostEqual(scaled[-1]["fitness"] / scaled[-32]["fitness"],
                                unscaled[-1]["fitness"] / unscaled[-32]["fitness"], places=5)
 
@@ -187,8 +187,8 @@ class ResponseConstantTests(unittest.TestCase):
     def test_intensity_adjustment_preserves_zone_based_input(self):
         easy = dashboard._fitness_effort({"hr": 139}, 25.7)
         hard = dashboard._fitness_effort({"hr": 161}, 185.6)
-        self.assertAlmostEqual(easy, 33.815, delta=0.01)
-        self.assertAlmostEqual(hard, 379.365, delta=0.1)
+        self.assertAlmostEqual(easy, 33.900, delta=0.01)
+        self.assertAlmostEqual(hard, 380.313, delta=0.1)
         self.assertAlmostEqual(dashboard._fitness_effort({"hr": 139}, 51.4), easy * 2)
 
 
