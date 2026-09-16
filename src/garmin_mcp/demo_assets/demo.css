@@ -6,3 +6,4 @@
 #demo-advice{display:grid;grid-template-columns:1fr auto;gap:12px}#demo-advice .em{display:none}#demo-advice .demo-sample-label{justify-self:start}#demo-advice p{grid-column:1/-1;grid-row:2;font-size:15px;line-height:1.6}#demo-advice button{grid-column:2;grid-row:1;align-self:start}.demo-story-grid:has(.demo-highlight){gap:20px}
 
 @media(max-width:480px){.demo-nav{gap:8px}.demo-brand{font-size:11px;white-space:nowrap}.demo-brand span{width:28px;height:28px;margin-right:4px}.demo-nav button{font-size:11px;white-space:nowrap;padding:8px 9px}.demo-nav>div{gap:4px}}
+@media(max-width:480px){.demo-intro h1{font-size:36px;line-height:1.2}.demo-intro h1 em{display:inline-block;font-size:32px;line-height:1.2;letter-spacing:-1px}}
