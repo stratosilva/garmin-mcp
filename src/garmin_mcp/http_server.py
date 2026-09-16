@@ -47,6 +47,10 @@ def build_asgi():
     # Open health route for Railway (added before auth wrapping so it stays open).
     asgi.router.routes.append(Route("/healthz", _healthz, methods=["GET"]))
 
+    # Only this synthetic, self-contained demo is public. Personal APIs stay protected.
+    from garmin_mcp.demo import demo_page
+    asgi.router.routes.append(Route("/demo", demo_page, methods=["GET"]))
+
     # Live dashboard (/dashboard + /api/dashboard), bearer-protected like /mcp.
     try:
         from garmin_mcp import get_client
@@ -56,7 +60,7 @@ def build_asgi():
     except Exception as e:  # noqa: BLE001 - dashboard is optional, never block startup
         print(f"garmin-mcp: dashboard routes not added: {e}")
 
-    return BearerAuthMiddleware(asgi, token=token, exempt_paths=("/healthz", "/favicon.ico"))
+    return BearerAuthMiddleware(asgi, token=token, exempt_paths=("/healthz", "/favicon.ico", "/demo"))
 
 
 def serve():
