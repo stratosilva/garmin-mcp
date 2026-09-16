@@ -22,6 +22,13 @@ class ManualWorkoutDeletionTests(unittest.TestCase):
             self.assertTrue(dashboard._delete_manual_activity('run','endurance'))
             self.assertEqual(dashboard._read_strength_log_unlocked()['manualActivities'],{})
 
+    def test_merged_workout_cannot_be_deleted(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'STRENGTH_LOG_PATH': str(Path(directory)/'strength.json')}), patch.object(dashboard, '_dashboard_database', return_value=None):
+            entry={'source':'merged','mergedGarminActivityId':123,'sets':[]}
+            dashboard._write_strength_log_unlocked({'activities':{},'manualWorkouts':{'linked':entry},'manualActivities':{}})
+            self.assertFalse(dashboard._delete_manual_activity('linked','strength'))
+            self.assertEqual(dashboard._read_strength_log_unlocked()['manualWorkouts']['linked'],entry)
+
     def test_database_deletion_is_scoped_and_parameterized(self):
         path=Path(__file__).parents[1]/'src/garmin_mcp/dashboard_storage.py'
         spec=importlib.util.spec_from_file_location('manual_storage_test',path)
@@ -31,7 +38,9 @@ class ManualWorkoutDeletionTests(unittest.TestCase):
         with patch.object(db,'ensure_schema'),patch.object(db,'_connect',return_value=connection):
             self.assertTrue(db.delete_manual_activity("manual-'quoted",'strength'))
             sql,args=cursor.execute.call_args.args
-            self.assertEqual(sql,'DELETE FROM dashboard_manual_strength_workouts WHERE manual_id = %s')
+            self.assertTrue(sql.startswith('DELETE FROM dashboard_manual_strength_workouts WHERE manual_id = %s'))
+            self.assertIn('merged_garmin_activity_id IS NULL',sql)
+            self.assertIn("COALESCE(payload->>'source', 'manual') <> 'merged'",sql)
             self.assertEqual(args,("manual-'quoted",))
             self.assertTrue(db.delete_manual_activity('run','endurance'))
             self.assertIn('dashboard_manual_endurance_activities',cursor.execute.call_args.args[0])

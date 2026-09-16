@@ -31,6 +31,9 @@ async function main(){
   context.window={confirm:()=>false,alert:()=>{}};context.fetch=async(url,options)=>{calls++;assert.equal(url,'/api/manual-strength-workouts/manual-123');assert.equal(options.method,'DELETE');return {ok:true,json:async()=>({deleted:true})};};
   await context.deleteManualWorkout(del);assert.equal(calls,0);context.window.confirm=()=>true;await context.deleteManualWorkout(del);assert.equal(calls,1);assert.equal(del.disabled,false);assert.equal(loads,2);
   assert.equal(context.manualDeleteButton({activityId:123,name:'Garmin run'}),'');assert.match(context.manualDeleteButton({manualEnduranceId:'local-run',name:'Run'}),/data-manual-kind="endurance"/);
+  assert.equal(context.manualDeleteButton({manualId:'linked',source:'merged',name:'Merged gym'}),'');
+  assert.equal(context.manualDeleteButton({manualId:'linked',mergedGarminActivityId:123}),'');
+  assert.match(context.manualDeleteButton({manualId:'local',source:'manual'}),/data-manual-delete/);
   console.log('Manual exercise append, draft preservation, save success/failure/timeout and delete confirmation passed.');
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

@@ -480,6 +480,9 @@ def _delete_manual_activity(manual_id, kind):
         entries = store["manualWorkouts" if kind == "strength" else "manualActivities"]
         if manual_id not in entries:
             return False
+        entry = entries[manual_id]
+        if entry.get("source") == "merged" or entry.get("mergedGarminActivityId"):
+            return False
         del entries[manual_id]
         _write_strength_log_unlocked(store)
         return True
@@ -2875,6 +2878,7 @@ async function saveStrengthDetails(){
 }
 
 function manualDeleteButton(activity){
+  if(activity.source==="merged"||activity.source==="garmin"||activity.mergedGarminActivityId)return "";
   var id=activity.manualId||activity.manualEnduranceId;if(!id)return "";
   var kind=activity.manualId?"strength":"endurance";
   return '<button type="button" class="strength-remove" data-manual-delete="'+esc(id)+'" data-manual-kind="'+kind+'" data-manual-name="'+esc(activity.name)+'" title="Delete manual workout" aria-label="Delete manual workout"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg></button>';
