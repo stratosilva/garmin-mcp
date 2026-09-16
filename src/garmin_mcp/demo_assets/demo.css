@@ -7,3 +7,8 @@
 
 @media(max-width:480px){.demo-nav{gap:8px}.demo-brand{font-size:11px;white-space:nowrap}.demo-brand span{width:28px;height:28px;margin-right:4px}.demo-nav button{font-size:11px;white-space:nowrap;padding:8px 9px}.demo-nav>div{gap:4px}}
 @media(max-width:480px){.demo-intro h1{font-size:36px;line-height:1.2}.demo-intro h1 em{display:inline-block;font-size:32px;line-height:1.2;letter-spacing:-1px}}
+
+.demo-key-hint{font-size:11px;color:var(--muted);margin:0 0 14px}.demo-intro-actions [data-tour-start]:not(:disabled){animation:demo-invite 1.5s ease-out 2}.demo-tour:not([hidden]) #tour-next{animation:demo-invite 1.5s ease-out 2}.demo-tour:not([hidden]){animation:demo-arrive .22s ease-out}.demo-nav button:disabled,.demo-intro button:disabled{opacity:.6;cursor:wait}
+@keyframes demo-invite{0%,100%{box-shadow:0 0 0 0 #0fa99900}40%{box-shadow:0 0 0 7px #0fa99930}}
+@keyframes demo-arrive{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@media(prefers-reduced-motion:reduce){.demo-intro-actions [data-tour-start]:not(:disabled),.demo-tour:not([hidden]),.demo-tour:not([hidden]) #tour-next{animation:none}}

@@ -5,7 +5,8 @@ The public `/demo` page reuses the real dashboard UI with synthetic data for
 
 ## What it demonstrates
 
-Nine short tour stops cover data integration, actionable AI advice, sleep and
+The tour opens only when a visitor clicks Start tour; Continue tour returns to
+the current step without restarting. Nine short tour stops cover data integration, actionable AI advice, sleep and
 recovery, muscle allocation, Strava-inspired analytics, Basic-Fit measurements,
 injury context, corrected workout inputs, and product strategy. Next, Enter,
 Space or Right Arrow advances; Left Arrow goes back; Escape or Skip exits.
@@ -38,7 +39,8 @@ fictional-data boundary. Exercise the tour, settings, notes, and Reset demo.
 
 Lead with the daily decision: an appropriate effort given training load,
 recovery and injury context. Describe integration methods accurately: Garmin
-connected data, entered Basic-Fit measurements, and manual injury reporting.
+connected data, entered body composition measurements, and manual injury reporting. Smart-scale
+sync is described as in development.
 Attribute Strava inspiration. Avoid unverified market-uniqueness claims or
 invented business impact. A useful next evaluation is recommendation relevance,
 clarity and uptake; the demo does not claim these outcomes are measured.

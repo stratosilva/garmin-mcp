@@ -46,7 +46,7 @@ def demo_data(today=None):
         muscles.append(dict(label=weeks[i]['rangeLabel'],isCurrent=i==11,muscles=rows,sources=dict(strengthSets=28,cardioSessions=3,cardioMinutes=160,steps=58000,floors=49),exerciseBreakdown=[
             dict(exercise='Dumbbell bench press',sets=3,mapped=True,muscles=[dict(label='Chest',role='primary',volumeCreditPct=100),dict(label='Triceps',role='assisting',volumeCreditPct=50)]),
             dict(exercise='Seated cable row',sets=3,mapped=True,muscles=[dict(label='Back',role='primary',volumeCreditPct=100),dict(label='Biceps',role='assisting',volumeCreditPct=50)])]))
-    definitions=[dict(id='demo_knee',name='Right knee sensitivity',color='#1683ff',enabled=True),dict(id='demo_shoulder',name='Left shoulder tightness',color='#f08c00',enabled=True),dict(id='demo_ankle',name='Ankle recovery',color='#e5484d',enabled=False)]
+    definitions=[dict(id='demo_knee',name='Right knee - patellar tendon',color='#1683ff',enabled=True),dict(id='demo_shoulder',name='Plantar fasciitis left foot',color='#f08c00',enabled=True),dict(id='demo_ankle',name='Ankle recovery',color='#e5484d',enabled=False)]
     records=[dict(date=day(29-i),demo_knee=max(1,round(4-i/12+math.sin(i)*.7)),demo_shoulder=max(0,round(3-i/11)),demo_ankle=max(0,3-i//5),notes=('Shorter walk felt comfortable. Keeping the next run easy.' if i==29 else 'Mobility work helped today.' if i==24 else '')) for i in range(30)]
     return dict(name='Miles Ahead',date=day(0),generatedAt=day(0)+' · fictional scenario',
         wellness=dict(bodyBattery=dict(current=58,high=82),steps=dict(value=6240,goal=9000,avg7=8240),restingHr=dict(value=54,avg7=52,min=49,max=56),stress=dict(avg=28,max=64),distanceKm=4.7,
