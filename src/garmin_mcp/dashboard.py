@@ -1409,6 +1409,7 @@ def _injury_measurements(days=30):
                             values[field] = float(row[field]) if row.get(field) not in (None, "") else None
                         except ValueError:
                             values[field] = None
+                    values["notes"] = row.get("notes") or ""
                     by_date[date] = values
     return {"definitions": definitions, "records": [
         {"date": (start + datetime.timedelta(days=offset)).isoformat(), **by_date.get(start + datetime.timedelta(days=offset), {})}
@@ -1430,9 +1431,14 @@ def _append_injury_measurement(payload):
         fields = [row["id"] for row in _injury_definitions() if row["enabled"]]
         if not fields:
             raise ValueError("enable an injury in settings before adding scores")
-        if set(payload) - {"date", *fields}:
+        if set(payload) - {"date", "notes", *fields}:
             raise ValueError("injury settings changed; reload the score form")
         scores = {}
+        if "notes" in payload:
+            notes = payload["notes"]
+            if not isinstance(notes, str) or len(notes) > 2000:
+                raise ValueError("notes must be text of up to 2,000 characters")
+            scores["notes"] = notes.strip()
         for field in fields:
             try:
                 value = float(payload[field])
@@ -2780,6 +2786,7 @@ button.rf svg{width:15px;height:15px}
 .contrib-bar i.optimal{background:var(--good)}.contrib-bar i.good{background:var(--accent)}.contrib-bar i.attention{background:var(--warn)}
 .contrib-note{display:block;margin-top:4px;font-size:11px;color:var(--faint)}
 .entry-actions{display:flex;justify-content:flex-end;margin-top:14px}.entry-form{display:none;margin-top:14px;padding:15px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2)}.entry-form.open{display:block}.entry-fields{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.injury-fields{grid-template-columns:repeat(3,1fr)}.entry-fields label{display:grid;gap:4px;font-size:12px;font-weight:700;color:var(--muted)}.entry-fields input,.entry-fields select{width:100%;border:1px solid var(--border);border-radius:9px;padding:9px;background:var(--surface);color:var(--text);font:inherit}.entry-submit{margin-top:12px;border:0;border-radius:999px;background:var(--accent);color:white;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer}.entry-status{margin:9px 0 0;font-size:12px;color:var(--muted)}.injurychart{width:100%;height:300px;display:block;margin-top:10px}.painlegend{display:flex;flex-wrap:wrap;gap:7px 14px;margin-top:12px;font-size:12px;color:var(--muted)}.painlegend span{display:flex;align-items:center;gap:5px}.painlegend i{width:9px;height:9px;border-radius:50%;display:inline-block}.pain-scale{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
+#injury-entry textarea{width:100%;box-sizing:border-box;resize:vertical;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--text);font:inherit}
 .injury-settings-dialog{width:min(720px,94vw);max-height:85vh;overflow:auto;border:1px solid var(--border);border-radius:18px;padding:24px;background:var(--surface);color:var(--text)}.injury-settings-dialog::backdrop{background:rgba(0,0,0,.45)}.injury-setting{display:grid;grid-template-columns:minmax(140px,1fr) 72px auto;gap:12px;align-items:center;padding:14px 0;border-bottom:1px solid var(--border);margin-bottom:12px}.injury-setting [data-injury-state]{grid-column:1/-1;justify-self:start}.injury-settings-dialog .entry-actions{gap:10px}.injury-settings-dialog p{color:var(--muted)}
 @media(max-width:640px){.entry-fields,.injury-fields{grid-template-columns:1fr 1fr}.injurychart{height:240px}.primarychart{height:250px}.loadchart text,.effortdaily text{font-size:21px!important}}@media(max-width:420px){.entry-fields,.injury-fields{grid-template-columns:1fr}}
 .strength-open{display:inline-flex;align-items:center;margin-top:5px;border:0;background:transparent;color:var(--accent);padding:2px 0;font:inherit;font-size:11.5px;font-weight:700;cursor:pointer}.strength-card-action{margin-top:12px;width:100%;justify-content:center!important;box-shadow:none!important;background:var(--surface-2)!important}
@@ -3088,6 +3095,7 @@ function fillInjuryScores(){
   var form=document.getElementById("injury-entry"),date=form.elements.namedItem("date").value;
   var row=(((CURRENT_DASHBOARD||{}).injuries||{}).records||[]).find(function(item){return item.date===date;})||{};
   form.querySelectorAll('input[type="number"]').forEach(function(input){input.value=row[input.name]==null?"":row[input.name];});
+  form.elements.namedItem("notes").value=row.notes||"";
 }
 
 function injurySettingsRow(item){
@@ -3126,7 +3134,7 @@ function drawInjuries(records,definitions){
   [0,7,14,21,29].filter(function(i){return i<records.length;}).forEach(function(i){var date=new Date(records[i].date+"T00:00:00"),text=document.createElementNS(ns,"text");text.setAttribute("x",X(i));text.setAttribute("y",H-12);text.setAttribute("text-anchor","middle");text.setAttribute("font-size",14);text.setAttribute("fill",css("--faint"));text.textContent=(date.getMonth()+1)+"/"+date.getDate();svg.appendChild(text);});
   var series=(definitions||[]).filter(function(item){return item.enabled;}).map(function(item){return {key:item.id,color:item.color,name:item.name};});
   series.forEach(function(s){var points=records.map(function(row,i){return row[s.key]==null?null:{x:X(i),y:Y(row[s.key])};}).filter(Boolean);if(!points.length)return;var path=document.createElementNS(ns,"path");path.setAttribute("d",points.map(function(point,i){return(i?"L":"M")+point.x.toFixed(1)+" "+point.y.toFixed(1);}).join(" "));path.setAttribute("fill","none");path.setAttribute("stroke",s.color);path.setAttribute("stroke-width",4);path.setAttribute("stroke-linecap","round");path.setAttribute("stroke-linejoin","round");svg.appendChild(path);points.forEach(function(point){var dot=document.createElementNS(ns,"circle");dot.setAttribute("cx",point.x);dot.setAttribute("cy",point.y);dot.setAttribute("r",6);dot.setAttribute("fill",css("--surface"));dot.setAttribute("stroke",s.color);dot.setAttribute("stroke-width",3);svg.appendChild(dot);});});
-  chartTip(svg,records,function(row){return "<b>"+esc(row.date)+"</b>"+series.map(function(item){return "<br>"+esc(item.name)+": "+(row[item.key]==null?"—":row[item.key]+" / 10");}).join("");});
+  chartTip(svg,records,function(row){return "<b>"+esc(row.date)+"</b>"+series.map(function(item){return "<br>"+esc(item.name)+": "+(row[item.key]==null?"—":row[item.key]+" / 10");}).join("")+(row.notes?"<br><b>Notes:</b> "+esc(row.notes).replace(/\n/g,"<br>"):"");});
 }
 
 function loadPersonalRecommendation(d,refresh){
@@ -3362,7 +3370,7 @@ function render(d){
   app.appendChild(sec("Injuries"));
   var injury=el("div","card");
   var injuryData=d.injuries||{},activeInjuries=(injuryData.definitions||[]).filter(function(item){return item.enabled;});
-  injury.innerHTML='<div class="label"><p class="eyebrow">Pain trend · last 30 days</p><button type="button" class="rf" id="injury-settings-open" aria-label="Injury settings">⚙ Settings</button></div><svg class="injurychart" id="injuryc" viewBox="0 0 1000 300" preserveAspectRatio="none"></svg><div class="painlegend">'+activeInjuries.map(function(item){return '<span><i style="background:'+esc(item.color)+'"></i>'+esc(item.name)+'</span>';}).join("")+'</div>'+(!activeInjuries.length?'<p>No active injuries. Open Settings to add or re-enable one. Your previous scores are retained.</p>':'')+'<div class="pain-scale"><b>Numeric Rating Scale (NRS-11):</b> 0 = no pain · 1–3 = mild · 4–6 = moderate · 7–10 = severe / worst pain imaginable.</div><div class="entry-actions"><button class="rf" id="injury-entry-toggle" '+(!activeInjuries.length?'disabled':'')+'>Add / edit pain scores</button></div><form class="entry-form" id="injury-entry"><label class="strength-field">Date<input type="date" name="date" id="injury-score-date" min="'+esc(((injuryData.records||[])[0]||{}).date||d.date)+'" value="'+esc(d.date)+'" max="'+esc(d.date)+'" required></label><div class="entry-fields injury-fields">'+activeInjuries.map(function(item){return '<label>'+esc(item.name)+' (0–10)<input name="'+esc(item.id)+'" type="number" min="0" max="10" step="1" required></label>';}).join("")+'</div><button class="entry-submit" type="submit" '+(!activeInjuries.length?'disabled':'')+'>Save scores</button><p class="entry-status" id="injury-entry-status"></p></form>';
+  injury.innerHTML='<div class="label"><p class="eyebrow">Pain trend · last 30 days</p><button type="button" class="rf" id="injury-settings-open" aria-label="Injury settings">⚙ Settings</button></div><svg class="injurychart" id="injuryc" viewBox="0 0 1000 300" preserveAspectRatio="none"></svg><div class="painlegend">'+activeInjuries.map(function(item){return '<span><i style="background:'+esc(item.color)+'"></i>'+esc(item.name)+'</span>';}).join("")+'</div>'+(!activeInjuries.length?'<p>No active injuries. Open Settings to add or re-enable one. Your previous scores are retained.</p>':'')+'<div class="pain-scale"><b>Numeric Rating Scale (NRS-11):</b> 0 = no pain · 1–3 = mild · 4–6 = moderate · 7–10 = severe / worst pain imaginable.</div><div class="entry-actions"><button class="rf" id="injury-entry-toggle" '+(!activeInjuries.length?'disabled':'')+'>Add / edit pain scores & notes</button></div><form class="entry-form" id="injury-entry"><label class="strength-field">Date<input type="date" name="date" id="injury-score-date" min="'+esc(((injuryData.records||[])[0]||{}).date||d.date)+'" value="'+esc(d.date)+'" max="'+esc(d.date)+'" required></label><div class="entry-fields injury-fields">'+activeInjuries.map(function(item){return '<label>'+esc(item.name)+' (0–10)<input name="'+esc(item.id)+'" type="number" min="0" max="10" step="1" required></label>';}).join("")+'</div><label class="strength-field">Daily notes (optional)<textarea name="notes" rows="3" maxlength="2000" placeholder="Symptoms, recovery progress, or what helped today…"></textarea><small>Up to 2,000 characters. Saved for the selected date.</small></label><button class="entry-submit" type="submit" '+(!activeInjuries.length?'disabled':'')+'>Save scores & notes</button><p class="entry-status" id="injury-entry-status"></p></form>';
   app.appendChild(injury);
 
   // recent activities

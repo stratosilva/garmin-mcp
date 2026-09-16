@@ -83,6 +83,37 @@ class InjurySettingsTests(unittest.TestCase):
         dashboard._append_injury_measurement(dict.fromkeys(self.fields, 4))
         db.upsert_injury_scores.assert_called_once_with(date, dict.fromkeys(self.fields, 4))
 
+    def test_notes_round_trip_edit_clear_and_omission_preserves(self):
+        scores = dict.fromkeys(self.fields, 2)
+        notes = "Less stiff today.\nWalking helped — feeling better."
+        dashboard._append_injury_measurement({**scores, "notes": notes})
+        self.assertEqual(dashboard._injury_measurements()["records"][-1]["notes"], notes)
+        dashboard._append_injury_measurement(scores)
+        self.assertEqual(dashboard._injury_measurements()["records"][-1]["notes"], notes)
+        dashboard._append_injury_measurement({**scores, "notes": "Improving"})
+        self.assertEqual(dashboard._injury_measurements()["records"][-1]["notes"], "Improving")
+        dashboard._append_injury_measurement({**scores, "notes": ""})
+        self.assertEqual(dashboard._injury_measurements()["records"][-1]["notes"], "")
+
+    def test_invalid_notes_do_not_overwrite_existing_entry(self):
+        scores = dict.fromkeys(self.fields, 2)
+        dashboard._append_injury_measurement({**scores, "notes": "Original"})
+        for value in [None, {}, 42, "x" * 2001]:
+            with self.assertRaises(ValueError):
+                dashboard._append_injury_measurement({**scores, "notes": value})
+        self.assertEqual(dashboard._injury_measurements()["records"][-1]["notes"], "Original")
+
+    def test_database_notes_read_and_write(self):
+        db = Mock()
+        self.database.return_value = db
+        db.injury_definitions.return_value = None
+        db.injury_measurements.return_value = []
+        db.injury_scores.return_value = [(datetime.date.today(), {"notes": "Recovering"})]
+        self.assertEqual(dashboard._injury_measurements()["records"][-1]["notes"], "Recovering")
+        scores = {**dict.fromkeys(self.fields, 1), "notes": "Improved"}
+        dashboard._append_injury_measurement(scores)
+        db.upsert_injury_scores.assert_called_once_with(datetime.date.today(), scores)
+
     def test_recommendations_exclude_disabled_scores(self):
         definitions = dashboard._injury_definitions()
         definitions[0]["enabled"] = False
