@@ -13,7 +13,7 @@ function client(){
 }
 (async()=>{
   const a=client(),b=client();
-  assert.equal((await a('/api/dashboard')).body.name,'Miles Ahead');
+  assert.equal((await a('/api/dashboard')).body.name,'Alan Turing');
   const definitions=structuredClone(seed.injuries.definitions);definitions[2].enabled=true;
   await a('/api/injury-settings',{definitions});
   assert.equal((await a('/api/injury-settings')).body.definitions[2].enabled,true);

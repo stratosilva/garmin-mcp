@@ -64,7 +64,7 @@ def demo_data(today=None):
     for contributor in contributors:
         value = contributor['percent']
         contributor['grade'] = 'optimal' if value >= 85 else 'good' if value >= 70 else 'attention'
-    return dict(name='Miles Ahead',date=day(0),generatedAt=day(0)+' · fictional scenario',
+    return dict(name='Alan Turing',date=day(0),generatedAt=day(0)+' · fictional scenario',
         wellness=dict(bodyBattery=dict(current=58,high=82),steps=dict(value=6240,goal=9000,avg7=8240),restingHr=dict(value=54,avg7=52,min=49,max=56),stress=dict(avg=28,max=64),distanceKm=4.7,
             readiness=dict(score=62),sleep=dict(score=68),hrv=dict(value=48,weeklyAvg=52,baselineLow=46,baselineHigh=64,status='BALANCED'),floors=dict(value=7,goal=10,avg7=9),vo2maxRun=47,vo2RatingAge=36,vo2maxRunDate=day(2),weight=dict(kg=76.8),
             calories=dict(total=2180,active=430,bmr=1750,avg7=2460),trainingLoad=dict(status='OPTIMAL',acute=370,chronic=410,acwr=.9),intensity=dict(total=172,goalWeek=150,moderate=92,vigorous=40)),

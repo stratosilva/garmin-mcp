@@ -28,7 +28,7 @@ class PublicDemoTests(unittest.TestCase):
         self.assertEqual(one,two)
         one['injuries']['records'][-1]['notes']='changed'
         self.assertNotEqual(one,two)
-        self.assertEqual(two['name'],'Miles Ahead')
+        self.assertEqual(two['name'],'Alan Turing')
         self.assertEqual(len(two['fitnessSeries']),732)
         for week in two['relativeEffort']['weeks']:
             self.assertEqual(week['effort'],sum(x['effort'] or 0 for x in week['days']))
@@ -57,7 +57,7 @@ class PublicDemoTests(unittest.TestCase):
         self.assertIn('Manuel Silva Gallego',page)
         self.assertIn('Built with ChatGPT',page)
         self.assertIn('Strava-inspired',page)
-        self.assertIn('Miles Ahead',page)
+        self.assertIn('Alan Turing',page)
         self.assertNotIn('new URLSearchParams(location.search).get("token")',page)
         self.assertIn('connect-src', (ROOT/'demo.py').read_text())
         self.assertLess(page.index('id="demo-story"'),page.index('// All demo edits'))

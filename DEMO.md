@@ -1,7 +1,7 @@
 # Public portfolio demo
 
 The public `/demo` page reuses the real dashboard UI with synthetic data for
-**Miles Ahead**. Credit: **Manuel Silva Gallego · Built with ChatGPT**.
+**Alan Turing**. Credit: **Manuel Silva Gallego · Built with ChatGPT**.
 
 ## What it demonstrates
 
@@ -32,7 +32,7 @@ Share the base Railway URL plus `/demo`, with **no query string or token**.
 
 Check `/demo` returns 200 without authorization. Check `/dashboard`,
 `/api/dashboard`, `/api/injury-settings` and `/mcp` still return 401 without it.
-The public page should identify Miles Ahead, Manuel Silva Gallego and the
+The public page should identify Alan Turing, Manuel Silva Gallego and the
 fictional-data boundary. Exercise the tour, settings, notes, and Reset demo.
 
 ## Positioning
