@@ -62,6 +62,7 @@
     document.querySelector('.bodygrid').id='demo-body';
     document.getElementById('injuryc').parentElement.id='demo-injuries';
     document.getElementById('debtc').parentElement.parentElement.id='demo-sleep';
+    document.getElementById('demo-sleep').previousElementSibling.id='demo-readiness';
     document.querySelector('.read').id='demo-advice';
     document.querySelector('.muscle-card').id='demo-muscles';
     document.querySelector('.grid.tri').id='demo-workouts';
@@ -73,7 +74,7 @@
   const steps=[
     {target:'#demo-intro',tag:'01 / THE OPPORTUNITY',title:'One person. Three disconnected pictures.',body:'Garmin-connected data shows training and recovery. Basic-Fit measurements add body composition. Neither tells the whole story of how a sore knee feels today. This product brings those perspectives into one daily view.',try:'A two-minute tour · Next, Enter or → to continue.'},
     {target:'#demo-advice',tag:'02 / THE DECISION',title:'Turn signals into a useful next step.',body:'The personal dashboard uses AI to suggest cardio, strength and recovery actions from the combined context. Here, a prepared example shows the reasoning: sleep is down, the knee needs care, and an easier day is appropriate.',try:'Read the example, including its “why”. The demo makes no live AI calls.'},
-    {target:'#demo-sleep',tag:'03 / THE CONTEXT',title:'A sleep score is only the beginning.',body:'Sleep debt, stages, timing and HRV trends make recovery easier to interpret. The aim is to help the athlete understand a pattern, instead of collecting another isolated number.',try:'After the tour, hover over a night to explore the detail.'},
+    {target:'#demo-readiness',tag:'03 / THE CONTEXT',title:'Understand what contributes to readiness.',body:'A sleep score is only the beginning. Seven readiness contributors bring together resting heart rate, HRV balance, sleep, sleep balance, sleep regularity, previous day activity and activity balance. The sleep debt, stages, timing and HRV charts below add detail, helping turn recovery patterns into a sensible training decision.',try:'Compare the contributors, then explore the sleep and HRV charts below after the tour.'},
     {target:'#demo-muscles',tag:'04 / THE TRANSLATION',title:'Make strength work visible.',body:'Exercise sets are mapped to muscle groups. Direct lifting work stays separate from estimated supporting exposure, so a busy week of cardio does not look like a complete strength programme.',try:'Use the week arrows and inspect the exercise allocation table.'},
     {target:'#demo-response',tag:'05 / THE ANALYTICS',title:'Move beyond the source metrics.',body:'Strava-inspired effort and fitness charts turn Garmin inputs into a longer view of training response. These are custom estimates, openly attributed—not a claim to reproduce Strava’s proprietary model.',try:'Switch between one month and two years, or select a week to inspect its daily effort.'},
     {target:'#demo-body',tag:'06 / THE CONNECTION',title:'Bring body composition into the picture.',body:'Sync or enter smart scale body composition measurements which sit beside Garmin-connected training and recovery. Different sources become a shared context for decisions—not another dashboard to check separately.',try:'Smart-scale sync is in development. Manual entry is available now; try it after the tour.'},

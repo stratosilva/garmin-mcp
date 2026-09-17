@@ -48,6 +48,22 @@ def demo_data(today=None):
             dict(exercise='Seated cable row',sets=3,mapped=True,muscles=[dict(label='Back',role='primary',volumeCreditPct=100),dict(label='Biceps',role='assisting',volumeCreditPct=50)])]))
     definitions=[dict(id='demo_knee',name='Right knee - patellar tendon',color='#1683ff',enabled=True),dict(id='demo_shoulder',name='Plantar fasciitis left foot',color='#f08c00',enabled=True),dict(id='demo_ankle',name='Ankle recovery',color='#e5484d',enabled=False)]
     records=[dict(date=day(29-i),demo_knee=max(1,round(4-i/12+math.sin(i)*.7)),demo_shoulder=max(0,round(3-i/11)),demo_ankle=max(0,3-i//5),notes=('Shorter walk felt comfortable. Keeping the next run easy.' if i==29 else 'Mobility work helped today.' if i==24 else '')) for i in range(30)]
+    # Mirror the personal dashboard's seven contributors using fictional inputs.
+    sleep_hours = sum(night['hours'] for night in nights[-14:])
+    yesterday_effort = next(d['effort'] for week in weeks for d in week['days'] if d['date'] == day(1))
+    previous_day_pct = round(max(0, min(1, 1 - (yesterday_effort / (145 / 7) - 1) / 3)) * 100)
+    contributors = [
+        dict(key='restingHr', label='Resting heart rate', percent=84, detail='54 bpm', note='baseline 52 bpm'),
+        dict(key='hrvBalance', label='HRV balance', percent=92, detail='Balanced', note='52 ms 7-day average'),
+        dict(key='sleep', label='Sleep', percent=nights[-1]['score'], detail='6.4 h', note='sleep score 68'),
+        dict(key='sleepBalance', label='Sleep balance', percent=round(sleep_hours / (7.5 * 14) * 100), detail=f'{round(sleep_hours)} h over 14 nights', note='need 7.5 h a night'),
+        dict(key='sleepRegularity', label='Sleep regularity', percent=82, detail='±24 min', note='drift in mid-sleep time'),
+        dict(key='previousDay', label='Previous day activity', percent=previous_day_pct, detail=f'{yesterday_effort} effort points', note='yesterday against a typical day'),
+        dict(key='activityBalance', label='Activity balance', percent=92, detail='In range', note='this week against your effort band'),
+    ]
+    for contributor in contributors:
+        value = contributor['percent']
+        contributor['grade'] = 'optimal' if value >= 85 else 'good' if value >= 70 else 'attention'
     return dict(name='Miles Ahead',date=day(0),generatedAt=day(0)+' · fictional scenario',
         wellness=dict(bodyBattery=dict(current=58,high=82),steps=dict(value=6240,goal=9000,avg7=8240),restingHr=dict(value=54,avg7=52,min=49,max=56),stress=dict(avg=28,max=64),distanceKm=4.7,
             readiness=dict(score=62),sleep=dict(score=68),hrv=dict(value=48,weeklyAvg=52,baselineLow=46,baselineHigh=64,status='BALANCED'),floors=dict(value=7,goal=10,avg7=9),vo2maxRun=47,vo2RatingAge=36,vo2maxRunDate=day(2),weight=dict(kg=76.8),
@@ -58,7 +74,7 @@ def demo_data(today=None):
         workouts=dict(hasData=True,week=dict(sessions=2,min=103,cal=625),last=recent[1],lastStrength=recent[1],types=[dict(name='Strength',count=2)]),
         recent=recent,strength=dict(activities=[]),muscleVolume=dict(weeks=muscles,currentIndex=11,formula='Direct sets are counted separately from estimated assisting, cardio and daily movement exposure.'),
         relativeEffort=dict(current=weeks[-1]['effort'],weeks=weeks,formula='Combines time in heart-rate zones and an intensity component.',rangeModel='An individual baseline provides context for each week.'),fitnessSeries=fitness,
-        recovery=dict(contributors=[dict(label='Sleep',percent=62,grade='fair',detail='6h 24m',note='Below the 7.5-hour scenario target.'),dict(label='HRV',percent=83,grade='good',detail='Within baseline'),dict(label='Training balance',percent=88,grade='good',detail='Load within range'),dict(label='Resting heart rate',percent=78,grade='good',detail='Slightly above average')],
+        recovery=dict(contributors=contributors,
             nights=nights,lastNight=nights[-1],sleepNeedHours=7.5,needModel='Sleep need shown for this fictional athlete.',debtModel='Rolling estimate, with recovery from longer nights.',regularity=dict(score=82,deviationMinutes=24),
             debt=dict(minutes=108,level='moderate',series=[dict(label=x['label'],minutes=round(70+40*math.sin(i/4)+i)) for i,x in enumerate(nights)])),
         hrvSeries=[dict(date=day(59-i),label=label(day(59-i)),value=round(53+6*math.sin(i/5)+2*math.sin(i)),baselineLow=46,baselineHigh=64,status='BALANCED') for i in range(60)],

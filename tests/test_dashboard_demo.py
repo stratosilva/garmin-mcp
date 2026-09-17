@@ -33,6 +33,25 @@ class PublicDemoTests(unittest.TestCase):
         for week in two['relativeEffort']['weeks']:
             self.assertEqual(week['effort'],sum(x['effort'] or 0 for x in week['days']))
 
+    def test_readiness_contributors_match_dashboard_and_synthetic_inputs(self):
+        # Include Monday, when yesterday belongs to the previous week.
+        for today in [datetime.date(2026, 9, 17), datetime.date(2026, 9, 21)]:
+            data = demo_data(today)
+            recovery = data['recovery']
+            contributors = recovery['contributors']
+            self.assertEqual([c['key'] for c in contributors], [
+                'restingHr', 'hrvBalance', 'sleep', 'sleepBalance',
+                'sleepRegularity', 'previousDay', 'activityBalance'])
+            self.assertEqual(contributors[2]['percent'], recovery['lastNight']['score'])
+            hours = sum(n['hours'] for n in recovery['nights'][-14:])
+            self.assertEqual(contributors[3]['detail'], f'{round(hours)} h over 14 nights')
+            yesterday = (today - datetime.timedelta(days=1)).isoformat()
+            effort = next(d['effort'] for w in data['relativeEffort']['weeks'] for d in w['days'] if d['date'] == yesterday)
+            self.assertEqual(contributors[5]['detail'], f'{effort} effort points')
+            for c in contributors:
+                self.assertIn(c['grade'], ('optimal', 'good', 'attention'))
+                self.assertTrue(c['note'])
+
     def test_page_contains_attribution_and_no_token_parameter(self):
         page=demo_html()
         self.assertIn('Manuel Silva Gallego',page)
