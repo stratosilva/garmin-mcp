@@ -92,7 +92,8 @@ class SleepDebtTests(unittest.TestCase):
 
     def test_series_covers_the_whole_window_for_charting(self):
         debt = dashboard._sleep_debt(nights({o: 6.0 for o in range(14)}), 7.5, TODAY)
-        self.assertEqual(len(debt["series"]), 30)
+        self.assertEqual(len(debt["series"]), 7)
+        self.assertEqual(debt["series"][0]["date"], (TODAY - datetime.timedelta(days=6)).isoformat())
         self.assertEqual(debt["series"][-1]["minutes"], debt["minutes"])
 
 

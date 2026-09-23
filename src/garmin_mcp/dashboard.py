@@ -1725,7 +1725,7 @@ def _sleep_debt(nights, need_hours, today, entries=None):
                 'napMinutes': nap, 'shortfallMinutes': round(shortfall) if shortfall is not None else None,
                 'source': source if hours is not None else 'missing', 'notes': manual.get('notes', '')}
     series = []
-    for offset in range(29, -1, -1):
+    for offset in range(6, -1, -1):
         day = today - datetime.timedelta(days=offset)
         rows = [daily(day - datetime.timedelta(days=i)) for i in range(6, -1, -1)]
         known = [row for row in rows if row['shortfallMinutes'] is not None]
@@ -1859,7 +1859,7 @@ def _recovery_metrics(sleep_series, hrv_series, rhr_series, wellness, effort, ag
         "lastNight": last_night or None,
         "nights": recent_nights,
         "sleepLog": sleep_log,
-        "needModel": f"Your chosen nightly target is {need_hours:g} h. It stays fixed until you change it in Sleep settings.",
+        "needModel": "",
         "debtModel": "Weekly estimate = sum of max(0, target − night sleep − logged naps) over the last 7 calendar days. Longer nights do not erase another day's shortfall. Missing nights are excluded; coverage is shown. Naps are entered manually, not imported from Garmin. This tracks sleep quantity, not complete physiological recovery.",
         "missing": "Body temperature is absent: Garmin Connect exposes no skin-temperature deviation.",
     }
@@ -3552,7 +3552,7 @@ function addSleepControls(card,rec,today){
     '<details><summary style="cursor:pointer;padding:12px 0">Sleep settings &amp; naps</summary>'+
     '<form data-sleep-target class="entry-form" style="display:block"><label class="strength-field">Nightly target (hours)<input name="targetHours" type="number" min="4" max="12" step="0.1" value="'+esc(log.targetHours)+'" required></label><p class="metricnote">Default 7.5 h. Changing this recalculates the displayed history; it does not measure your biological sleep need.</p><button class="entry-submit">Save target</button><p role="status"></p></form>'+
     '<form data-sleep-day class="entry-form" style="display:block"><label class="strength-field">Date (night ending and naps on this day)<input name="date" type="date" max="'+esc(today)+'" value="'+esc(today)+'" required></label><div class="entry-fields"><label>Total nap minutes<input name="napMinutes" type="number" min="0" max="720" step="1" value="0" required></label><label>Night sleep correction (hours, optional)<input name="nightHours" type="number" min="0" max="24" step="0.01" placeholder="Use Garmin"></label></div><p class="metricnote">Enter actual sleep, not time in bed. Naps are manual totals for the selected date, counted once. A night correction replaces Garmin duration only in this estimate. Leave it blank to use Garmin; missing nights need a duration before naps can count. Today remains provisional until the day ends.</p><label class="strength-field">Daily context (optional)<textarea name="notes" rows="3" maxlength="2000" placeholder="Illness, stress, travel, late caffeine, interruptions, how rested you feel…"></textarea></label><p class="metricnote">Notes inform the context for AI advice; they do not add or subtract sleep minutes. To remove an entry, set naps to 0, clear the correction and notes, then save.</p><button class="entry-submit">Save day</button><p role="status"></p></form></details>';
-  var caption=document.createElement('p');caption.className='metricnote';caption.textContent='30-day trend of the rolling weekly shortfall. Dashed sections have fewer than 7 recorded days.';card.appendChild(caption);
+  var caption=document.createElement('p');caption.className='metricnote';caption.textContent='Last 7 days: each point shows the preceding seven-day shortfall. Green: under 3 h; yellow: 3–9 h; red: over 9 h. These are visual guides, not clinical cutoffs. Dashed sections have fewer than 7 recorded days.';card.appendChild(caption);
   card.appendChild(panel);
   var dayForm=panel.querySelector('[data-sleep-day]');
   function populate(){var entry=(log.entries||{})[dayForm.elements.date.value]||{};dayForm.elements.napMinutes.value=entry.napMinutes||0;dayForm.elements.nightHours.value=entry.nightHours==null?'':entry.nightHours;dayForm.elements.notes.value=entry.notes||'';}
@@ -3573,13 +3573,19 @@ function addSleepControls(card,rec,today){
 }
 
 function drawDebt(debt){
-  var svg=document.getElementById("debtc"),rows=(debt||{}).series||[];if(!svg||!rows.length)return;svg.innerHTML="";
+  var svg=document.getElementById("debtc"),rows=((debt||{}).series||[]).slice(-7);if(!svg||!rows.length)return;svg.innerHTML="";
   // The gutter holds durations such as "5h" or "30m", so it needs more room
   // than the numeric axes elsewhere on the page.
   var W=Math.max(280,svg.clientWidth||1000),H=220,pL=50,pR=16,pT=18,pB=34,bands=(debt.bands||[180,540,900]);
   svg.setAttribute("viewBox","0 0 "+W+" "+H);
   var max=Math.max.apply(null,rows.map(function(x){return x.minutes;}).concat([bands[1]]))*1.2;
   function Y(v){return pT+(max-v)/max*(H-pT-pB)}
+  [['good',0,bands[0]],['warn',bands[0],bands[1]],['low',bands[1],max]].forEach(function(band){
+    if(band[1]>=max)return;
+    var rect=document.createElementNS(ns,'rect');rect.setAttribute('x',pL);rect.setAttribute('width',W-pL-pR);
+    rect.setAttribute('y',Y(Math.min(band[2],max)));rect.setAttribute('height',Y(band[1])-Y(Math.min(band[2],max)));
+    rect.setAttribute('fill',css('--'+band[0]));rect.setAttribute('opacity','.10');svg.appendChild(rect);
+  });
   function X(i){return pL+i*(W-pL-pR)/Math.max(1,rows.length-1)}
   [false,true].forEach(function(partial){
     var line='';
@@ -3594,14 +3600,18 @@ function drawDebt(debt){
     if(partial)path.setAttribute('stroke-dasharray','7 6');svg.appendChild(path);
   });
   rows.forEach(function(x,i){
-    if(x.minutes==null)return;
-    var cx=pL+i*(W-pL-pR)/Math.max(1,rows.length-1),last=i===rows.length-1;
-    var c=document.createElementNS(ns,"circle");c.setAttribute("cx",cx);c.setAttribute("cy",Y(x.minutes));
-    c.setAttribute("r",last?8:4);c.setAttribute("fill",last?css("--accent"):css("--surface"));
-    c.setAttribute("stroke",css("--accent"));c.setAttribute("stroke-width",3);svg.appendChild(c);
-    if(W<500?(i===0||i===Math.floor((rows.length-1)/2)||last):((i%Math.ceil(rows.length/5)===0&&i<rows.length-3)||last)){var t=document.createElementNS(ns,"text");t.setAttribute("x",cx);t.setAttribute("y",H-9);
-      t.setAttribute("text-anchor",last?"end":i===0?"start":"middle");t.setAttribute("font-size",16);
-      t.setAttribute("fill",last?css("--accent"):css("--faint"));t.textContent=x.label;svg.appendChild(t);}
+    var cx=X(i),last=i===rows.length-1;
+    if(x.minutes!=null){
+      var c=document.createElementNS(ns,"circle");c.setAttribute("cx",cx);c.setAttribute("cy",Y(x.minutes));
+      c.setAttribute("r",last?8:4);c.setAttribute("fill",last?css("--accent"):css("--surface"));
+      c.setAttribute("stroke",css("--accent"));c.setAttribute("stroke-width",3);svg.appendChild(c);
+    }
+    var t=document.createElementNS(ns,"text");t.setAttribute("x",cx);t.setAttribute("y",H-9);
+    t.setAttribute("text-anchor",last?"end":i===0?"start":"middle");
+    t.style.setProperty('font-size',W<500?'11px':'16px','important');
+    t.setAttribute("fill",last?css("--accent"):css("--faint"));
+    t.textContent=x.date?new Date(x.date+'T12:00:00').toLocaleDateString('en',{weekday:'short'}):x.label;
+    svg.appendChild(t);
   });
   var lastLabelY=null;
   [0].concat(bands).forEach(function(v){
