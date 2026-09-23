@@ -37,22 +37,22 @@ def nights(hours_by_offset, bed=23.0):
 
 
 class SleepNeedTests(unittest.TestCase):
-    def test_need_blends_history_with_the_age_guideline(self):
+    def test_default_target_is_fixed_at_seven_and_a_half_hours(self):
         series = nights({offset: 7.0 for offset in range(14)})
         need, guideline, achieved = dashboard._sleep_need_hours(series, age=45)
         self.assertEqual(guideline, 8.0)          # 18-64 band midpoint
         self.assertEqual(achieved, 7.0)
-        self.assertEqual(need, 7.5)               # halfway between the two
+        self.assertEqual(need, 7.5)               # chosen target, not history-derived
 
-    def test_need_falls_back_to_the_guideline_without_history(self):
+    def test_target_is_seven_and_a_half_without_history(self):
         need, guideline, achieved = dashboard._sleep_need_hours([], age=45)
         self.assertIsNone(achieved)
-        self.assertEqual(need, guideline)
+        self.assertEqual(need, 7.5)
 
     def test_need_stays_inside_sane_bounds_for_a_heavy_sleeper(self):
         series = nights({offset: 12.0 for offset in range(14)})
         need, _, _ = dashboard._sleep_need_hours(series, age=45)
-        self.assertLessEqual(need, dashboard.SLEEP_NEED_MAX_HOURS)
+        self.assertEqual(need, 7.5)
 
     def test_older_athletes_get_the_lower_guideline(self):
         self.assertEqual(dashboard._recommended_sleep_hours(70), 7.5)
@@ -70,11 +70,11 @@ class SleepDebtTests(unittest.TestCase):
         self.assertGreater(debt["minutes"], 60)
         self.assertIn(debt["level"], {"low", "moderate", "high"})
 
-    def test_a_surplus_night_cancels_an_earlier_deficit(self):
+    def test_surplus_does_not_erase_another_days_shortfall(self):
         deficit_only = dashboard._sleep_debt(nights({0: 7.5, 1: 5.5}), 7.5, TODAY)
         with_surplus = dashboard._sleep_debt(nights({0: 9.5, 1: 5.5}), 7.5, TODAY)
         self.assertGreater(deficit_only["minutes"], 0)
-        self.assertLess(with_surplus["minutes"], deficit_only["minutes"])
+        self.assertEqual(with_surplus["minutes"], deficit_only["minutes"])
 
     def test_a_night_without_the_watch_is_skipped_not_counted_as_zero(self):
         """A missing night must not inject a full night of phantom debt."""
@@ -83,7 +83,7 @@ class SleepDebtTests(unittest.TestCase):
             nights({o: 7.5 for o in range(14) if o != 3}), 7.5, TODAY)
         self.assertEqual(with_gap["minutes"], complete["minutes"])
 
-    def test_recent_nights_weigh_more_than_old_ones(self):
+    def test_nights_outside_seven_days_expire(self):
         recent_bad = dashboard._sleep_debt(
             nights({**{o: 7.5 for o in range(14)}, 0: 4.0}), 7.5, TODAY)
         old_bad = dashboard._sleep_debt(
@@ -92,7 +92,7 @@ class SleepDebtTests(unittest.TestCase):
 
     def test_series_covers_the_whole_window_for_charting(self):
         debt = dashboard._sleep_debt(nights({o: 6.0 for o in range(14)}), 7.5, TODAY)
-        self.assertEqual(len(debt["series"]), dashboard.SLEEP_DEBT_DAYS)
+        self.assertEqual(len(debt["series"]), 30)
         self.assertEqual(debt["series"][-1]["minutes"], debt["minutes"])
 
 
@@ -271,7 +271,7 @@ class ContributorTests(unittest.TestCase):
     def test_contributors_with_no_data_are_omitted_rather_than_shown_empty(self):
         payload = dashboard._recovery_metrics([], [], [], {}, {}, 45, TODAY)
         self.assertEqual(payload["contributors"], [])
-        self.assertEqual(payload["sleepNeedHours"], 8.0)
+        self.assertEqual(payload["sleepNeedHours"], 7.5)
 
     def test_reports_the_missing_metric_honestly(self):
         self.assertIn("temperature", self.build()["missing"].lower())

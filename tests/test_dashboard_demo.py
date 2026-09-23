@@ -76,7 +76,7 @@ class PublicDemoTests(unittest.TestCase):
             await middleware({'type':'http','path':path,'headers':[],'query_string':b''},None,send)
             return events[0]['status']
         self.assertEqual(asyncio.run(check('/demo')),200)
-        for path in ['/dashboard','/api/dashboard','/api/injury-settings','/mcp','/demo/api/dashboard','/demo/']:
+        for path in ['/dashboard','/api/dashboard','/api/injury-settings','/api/sleep-log','/mcp','/demo/api/dashboard','/demo/']:
             self.assertEqual(asyncio.run(check(path)),401,path)
 
 

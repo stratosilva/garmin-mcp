@@ -203,6 +203,9 @@ def _recommendation_snapshot(dashboard):
             "resting_heart_rate": wellness.get("restingHr"),
             "stress": wellness.get("stress"),
             "sleep_debt": ((dashboard.get("recovery") or {}).get("debt") or {}).get("minutes"),
+            "manual_sleep_context": ((dashboard.get("recovery") or {}).get("debt") or {}).get("days"),
+            "sleep_target_hours": (dashboard.get("recovery") or {}).get("sleepNeedHours"),
+            "sleep_days_recorded": ((dashboard.get("recovery") or {}).get("debt") or {}).get("recordedDays"),
             "sleep_debt_level": ((dashboard.get("recovery") or {}).get("debt") or {}).get("level"),
             "sleep_need_hours": (dashboard.get("recovery") or {}).get("sleepNeedHours"),
             "sleep_regularity": (dashboard.get("recovery") or {}).get("regularity"),
@@ -1520,14 +1523,9 @@ def _find_num(data, keys):
 # Oura's readiness/sleep breakdown. Body temperature has no equivalent in the
 # Garmin Connect endpoints, so that contributor is deliberately absent.
 
-SLEEP_HISTORY_DAYS = 60          # window for baselines and personalised need
-SLEEP_DEBT_DAYS = 14             # rolling window the debt accumulates over
-SLEEP_DEBT_DECAY = 0.9           # older nights in that window count for less
-SLEEP_NEED_HISTORY_WEIGHT = 0.5  # blend of achieved sleep vs the age guideline
-SLEEP_NEED_MIN_HOURS = 6.5
-SLEEP_NEED_MAX_HOURS = 9.0
-# Sleep debt bands, in minutes, matching Oura's none/low/moderate/high wording.
-SLEEP_DEBT_BANDS = ((30, "none"), (120, "low"), (300, "moderate"))
+SLEEP_HISTORY_DAYS = 60          # history for recovery context and sleep trends
+SLEEP_CONTEXT_DAYS = 14          # sleep balance and regularity context
+
 
 
 def _recommended_sleep_hours(age):
@@ -1627,57 +1625,127 @@ def _percentile(values, fraction):
 
 
 def _sleep_need_hours(nights, age):
-    """Blend what the athlete actually achieves with the age guideline.
-
-    Using history alone would ratify chronic under-sleeping; using the
-    guideline alone ignores that sleep need genuinely varies between people.
-    The achieved figure is the 80th percentile of recorded nights — close to an
-    unconstrained night rather than an average dragged down by early alarms.
-    """
-    guideline = _recommended_sleep_hours(age)
-    achieved = _percentile([night["hours"] for night in nights if night.get("hours")], 0.8)
-    if achieved is None:
-        return round(guideline, 2), guideline, None
-    need = (SLEEP_NEED_HISTORY_WEIGHT * achieved
-            + (1 - SLEEP_NEED_HISTORY_WEIGHT) * guideline)
-    need = max(SLEEP_NEED_MIN_HOURS, min(SLEEP_NEED_MAX_HOURS, need))
-    return round(need, 2), guideline, round(achieved, 2)
+    """A chosen target, not a physiological need inferred from restricted sleep."""
+    achieved = _percentile([n["hours"] for n in nights if n.get("hours")], 0.8)
+    return 7.5, _recommended_sleep_hours(age), achieved
 
 
-def _sleep_debt(nights, need_hours, today):
-    """Rolling shortfall against sleep need, with surplus nights offsetting.
+_SLEEP_LOG_LOCK = threading.Lock()
 
-    Nights with no recording are skipped rather than counted as zero sleep: a
-    night without the watch would otherwise inject a full night of phantom
-    debt. Recent nights are weighted more heavily, so the number responds to
-    the last few days rather than dragging a fortnight-old deficit forever.
-    """
-    by_date = {night["date"]: night for night in nights}
-    series, running = [], 0.0
-    for offset in range(SLEEP_DEBT_DAYS - 1, -1, -1):
+
+def _sleep_log_path():
+    return Path(os.environ.get("SLEEP_LOG_PATH") or (_injury_measurements_path().parent / "sleep_log.json"))
+
+
+def _sleep_log():
+    db = _dashboard_database()
+    if db:
+        return db.sleep_log()
+    path = _sleep_log_path()
+    if not path.exists():
+        return {"targetHours": 7.5, "entries": {}}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _save_sleep_log(payload, today=None):
+    """Upsert one day's manual inputs; never modify Garmin's sleep record."""
+    import math
+    today = today or datetime.date.today()
+    if not isinstance(payload, dict):
+        raise ValueError("Enter sleep settings or a daily sleep entry.")
+    def number(value, low, high, label):
+        if isinstance(value, bool):
+            raise ValueError(label + " must be a number.")
+        try:
+            value = float(value)
+        except (ValueError, TypeError):
+            raise ValueError(label + " must be a number.")
+        if not math.isfinite(value) or not low <= value <= high:
+            raise ValueError(f"{label} must be between {low} and {high}.")
+        return value
+    target = number(payload['targetHours'], 4, 12, 'Nightly target') if 'targetHours' in payload else None
+    date, entry = None, None
+    if 'date' in payload:
+        try:
+            date = datetime.date.fromisoformat(payload['date']).isoformat()
+        except (ValueError, TypeError):
+            raise ValueError("Choose a valid date.")
+        if date > today.isoformat():
+            raise ValueError("Sleep entries cannot be in the future.")
+        nap = number(payload.get('napMinutes', 0), 0, 720, 'Nap minutes')
+        if not nap.is_integer():
+            raise ValueError("Enter whole nap minutes.")
+        hours = payload.get('nightHours')
+        hours = None if hours in (None, '') else number(hours, 0, 24, 'Night sleep hours')
+        if hours is not None and hours * 60 + nap > 1440:
+            raise ValueError("Total sleep cannot exceed 24 hours in a day.")
+        notes = payload.get('notes', '')
+        if not isinstance(notes, str) or len(notes) > 2000:
+            raise ValueError("Notes must be text, up to 2,000 characters.")
+        entry = {'napMinutes': int(nap), 'nightHours': hours, 'notes': notes.strip()}
+    if target is None and date is None:
+        raise ValueError("No sleep changes supplied.")
+    with _SLEEP_LOG_LOCK:
+        db = _dashboard_database()
+        if db:
+            db.save_sleep_log(target, date, entry)
+        else:
+            data = _sleep_log()
+            if target is not None:
+                data['targetHours'] = target
+            if date is not None:
+                data['entries'][date] = entry
+            path = _sleep_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(data), encoding='utf-8')
+            temporary.replace(path)
+    try:
+        _recommendation_cache_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+    return _sleep_log()
+
+
+def _sleep_debt(nights, need_hours, today, entries=None):
+    """Seven-day sum of daily shortfalls; no interest or surplus repayment."""
+    entries = entries or {}
+    by_date = {night['date']: night for night in nights}
+    def daily(day):
+        date = day.isoformat()
+        night, manual = by_date.get(date, {}), entries.get(date, {})
+        hours = manual.get('nightHours')
+        source = 'manual' if hours is not None else 'Garmin'
+        if hours is None:
+            seconds = night.get('seconds')
+            hours = seconds / 3600 if seconds is not None else night.get('hours')
+        nap = manual.get('napMinutes', 0)
+        shortfall = max(0, need_hours * 60 - hours * 60 - nap) if hours is not None else None
+        return {'date': date, 'label': day.strftime('%b %d'), 'nightHours': hours,
+                'napMinutes': nap, 'shortfallMinutes': round(shortfall) if shortfall is not None else None,
+                'source': source if hours is not None else 'missing', 'notes': manual.get('notes', '')}
+    series = []
+    for offset in range(29, -1, -1):
         day = today - datetime.timedelta(days=offset)
-        total = 0.0
-        for age_days in range(SLEEP_DEBT_DAYS):
-            night = by_date.get((day - datetime.timedelta(days=age_days)).isoformat())
-            if not night or not night.get("hours"):
-                continue
-            total += (need_hours - night["hours"]) * 60.0 * (SLEEP_DEBT_DECAY ** age_days)
-        running = max(0.0, total)
-        series.append({"date": day.isoformat(), "label": day.strftime("%a"),
-                       "minutes": round(running)})
-    level = "high"
-    for limit, name in SLEEP_DEBT_BANDS:
-        if running < limit:
-            level = name
-            break
-    return {"minutes": round(running), "level": level, "series": series,
-            "bands": [limit for limit, _ in SLEEP_DEBT_BANDS]}
+        rows = [daily(day - datetime.timedelta(days=i)) for i in range(6, -1, -1)]
+        known = [row for row in rows if row['shortfallMinutes'] is not None]
+        series.append({'date': day.isoformat(), 'label': day.strftime('%b %d'),
+                       'minutes': sum(row['shortfallMinutes'] for row in known) if known else None,
+                       'recordedDays': len(known)})
+    rows = [daily(today - datetime.timedelta(days=i)) for i in range(6, -1, -1)]
+    known = [row for row in rows if row['shortfallMinutes'] is not None]
+    total = series[-1]['minutes']
+    return {'minutes': total, 'level': 'none' if total == 0 else 'low' if total is not None and total < 240 else 'moderate' if total is not None and total < 600 else 'high' if total is not None else 'unknown',
+            'series': series, 'bands': [180, 540, 900], 'windowDays': 7,
+            'recordedDays': len(known), 'missingDays': 7 - len(known), 'days': rows,
+            'napMinutes': sum(row['napMinutes'] for row in known),
+            'averageHours': round(sum(row['nightHours'] + row['napMinutes']/60 for row in known)/len(known), 2) if known else None}
 
 
 def _sleep_regularity(nights):
     """Consistency of mid-sleep time, the strongest circadian signal we have."""
     points = []
-    for night in nights[-SLEEP_DEBT_DAYS:]:
+    for night in nights[-SLEEP_CONTEXT_DAYS:]:
         bed, wake = night.get("bedTime"), night.get("wakeTime")
         if bed is None or wake is None:
             continue
@@ -1708,14 +1776,16 @@ def _titlecase(value):
     return text[:1].upper() + text[1:].lower() if text else None
 
 
-def _recovery_metrics(sleep_series, hrv_series, rhr_series, wellness, effort, age, today):
+def _recovery_metrics(sleep_series, hrv_series, rhr_series, wellness, effort, age, today, sleep_log=None):
     """Assemble the readiness contributors and the derived sleep figures."""
     need_hours, guideline_hours, achieved_hours = _sleep_need_hours(sleep_series, age)
-    debt = _sleep_debt(sleep_series, need_hours, today)
+    sleep_log = sleep_log or {"targetHours": 7.5, "entries": {}}
+    need_hours = sleep_log["targetHours"]
+    debt = _sleep_debt(sleep_series, need_hours, today, sleep_log["entries"])
     regularity = _sleep_regularity(sleep_series)
     last_night = wellness.get("sleep") or {}
     hrv_today = wellness.get("hrv") or {}
-    recent_nights = sleep_series[-SLEEP_DEBT_DAYS:]
+    recent_nights = sleep_series[-SLEEP_CONTEXT_DAYS:]
     balance_hours = sum(night["hours"] for night in recent_nights)
     balance_pct = (round(balance_hours / (need_hours * len(recent_nights)) * 100)
                    if recent_nights else None)
@@ -1788,19 +1858,9 @@ def _recovery_metrics(sleep_series, hrv_series, rhr_series, wellness, effort, ag
         "rhrBaseline": rhr_baseline,
         "lastNight": last_night or None,
         "nights": recent_nights,
-        "needModel": (
-            f"Sleep need blends the {guideline_hours} h guideline for your age with the "
-            f"{achieved_hours} h you reach on an unhurried night (80th percentile of "
-            f"{len(sleep_series)} recorded nights), giving {need_hours} h."
-            if achieved_hours else
-            f"Sleep need defaults to the {guideline_hours} h guideline for your age "
-            "until more nights are recorded."
-        ),
-        "debtModel": (
-            f"Debt is the shortfall against that need across {SLEEP_DEBT_DAYS} nights, with "
-            "surplus nights cancelling deficits and recent nights weighted more heavily. "
-            "Nights without the watch are skipped, not counted as sleepless."
-        ),
+        "sleepLog": sleep_log,
+        "needModel": f"Your chosen nightly target is {need_hours:g} h. It stays fixed until you change it in Sleep settings.",
+        "debtModel": "Weekly estimate = sum of max(0, target − night sleep − logged naps) over the last 7 calendar days. Longer nights do not erase another day's shortfall. Missing nights are excluded; coverage is shown. Naps are entered manually, not imported from Garmin. This tracks sleep quantity, not complete physiological recovery.",
         "missing": "Body temperature is absent: Garmin Connect exposes no skin-temperature deviation.",
     }
 
@@ -2184,7 +2244,7 @@ def gather(client):
     sleep_rows = _call(client.get_sleep_daily, history_start, ds) or []
     sleep_series = [night for night in (_sleep_night(row) for row in sleep_rows) if night]
     if not sleep_series:  # older accounts without the stats endpoint
-        for i in range(SLEEP_DEBT_DAYS - 1, -1, -1):
+        for i in range(SLEEP_CONTEXT_DAYS - 1, -1, -1):
             day = today - datetime.timedelta(days=i)
             night = _sleep_night(_call(client.get_sleep_data, day.isoformat()))
             if night:
@@ -2210,7 +2270,7 @@ def gather(client):
             values["label"] = datetime.date.fromisoformat(values["date"]).strftime("%a")
             hrv_series.append(values)
     if not hrv_series:  # range endpoint unavailable: fall back to recent days
-        for i in range(SLEEP_DEBT_DAYS - 1, -1, -1):
+        for i in range(SLEEP_CONTEXT_DAYS - 1, -1, -1):
             day = today - datetime.timedelta(days=i)
             values = _hrv_values(_call(client.get_hrv_data, day.isoformat()))
             if values["value"] is not None or values["status"]:
@@ -2452,7 +2512,7 @@ def gather(client):
     # Readiness contributors depend on the effort band above, so they are built
     # once it exists rather than alongside the raw sleep history.
     out["recovery"] = _recovery_metrics(sleep_series, hrv_series, rhr_series, w,
-                                        out["relativeEffort"], age, today)
+                                        out["relativeEffort"], age, today, _sleep_log())
 
     # ---- HR zones this week (minutes per zone) ----
     zsum = [0.0, 0.0, 0.0, 0.0, 0.0]
@@ -2505,6 +2565,13 @@ def add_dashboard_routes(asgi_app, client):
 
     async def page(_request):
         return HTMLResponse(PAGE_HTML)
+
+    async def sleep_log(request):
+        try:
+            data = _save_sleep_log(await request.json()) if request.method == "POST" else _sleep_log()
+            return JSONResponse(data)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
 
     async def body_measurements(request):
         if request.method == "GET":
@@ -2635,6 +2702,7 @@ def add_dashboard_routes(asgi_app, client):
         return Response(svg, media_type="image/svg+xml",
                         headers={"cache-control": "public, max-age=86400"})
 
+    asgi_app.router.routes.append(Route("/api/sleep-log", sleep_log, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/dashboard", api, methods=["GET"]))
     asgi_app.router.routes.append(Route("/api/body-measurements", body_measurements, methods=["GET", "POST"]))
     asgi_app.router.routes.append(Route("/api/injury-settings", injury_settings, methods=["GET", "POST"]))
@@ -3297,14 +3365,15 @@ function render(d){
   var sleepGrid=el("div","keycharts");
   // sleep debt
   var debtCard=el("div","card");
-  var debtLabel={none:"None",low:"Low",moderate:"Moderate",high:"High"}[debt.level]||"—";
-  debtCard.innerHTML='<div class="label"><p class="eyebrow">Sleep debt · '+n(rec.nights?rec.nights.length:0)+' nights</p>'+
-    '<span class="pill '+(debt.level==="none"?"good":debt.level==="low"?"warn":"low")+'">'+debtLabel+'</span></div>'+
-    '<div class="big"><span>'+fmtMinutes(debt.minutes)+'</span><span class="unit">behind</span></div>'+
-    '<div class="meta">Sleep need '+n(rec.sleepNeedHours)+' h · last night '+n(lastNight.hours)+' h'+
+  var debtLabel=debt.windowDays?(debt.missingDays?'Partial data':'7-day estimate'):({none:'None',low:'Low',moderate:'Moderate',high:'High'}[debt.level]||'—');
+  debtCard.innerHTML='<div class="label"><p class="eyebrow">Sleep debt · '+(debt.windowDays?'rolling 7 days':n(rec.nights?rec.nights.length:0)+' nights')+'</p>'+
+    '<span class="pill '+(debt.windowDays?'':debt.level==="none"?"good":debt.level==="low"?"warn":"low")+'">'+debtLabel+'</span></div>'+
+    '<div class="big"><span>'+fmtMinutes(debt.minutes)+'</span><span class="unit">shortfall</span></div>'+
+    '<div class="meta">Nightly target '+n(rec.sleepNeedHours)+' h · Garmin night '+n(lastNight.hours)+' h'+
       (lastNight.efficiency?' · '+lastNight.efficiency+'% efficient':'')+'</div>'+
     '<svg class="loadchart" id="debtc" viewBox="0 0 1000 220" preserveAspectRatio="none"></svg>'+
-    '<div class="metricnote">'+n(rec.needModel)+' '+n(rec.debtModel)+'</div>';
+    '<div class="metricnote">'+esc(rec.needModel||'')+' '+esc(rec.debtModel||'')+'</div>';
+  if(rec.sleepLog) addSleepControls(debtCard,rec,d.date);
   sleepGrid.appendChild(debtCard);
 
   // sleep stages
@@ -3474,29 +3543,63 @@ function fmtClock(hours){
 }
 
 // Sleep debt over the rolling window, with Oura-style severity bands.
+function addSleepControls(card,rec,today){
+  var debt=rec.debt||{},log=rec.sleepLog,days=debt.days||[];
+  card.id='sleep-debt-card';
+  var panel=document.createElement('div');
+  panel.innerHTML='<p class="metricnote"><b>'+n(debt.recordedDays)+'/7 days recorded</b> · '+fmtMinutes(debt.napMinutes)+' naps included · '+n(debt.averageHours)+' h average total sleep'+(debt.missingDays?' · Missing nights are not treated as zero sleep.':'')+'</p>'+
+    '<details><summary style="cursor:pointer;padding:12px 0">Day-by-day sleep &amp; shortfall</summary><div style="overflow-x:auto"><table style="width:100%;text-align:left"><thead><tr><th>Date</th><th>Night</th><th>Naps</th><th>Shortfall</th></tr></thead><tbody>'+days.map(function(x){return '<tr><td>'+esc(x.date)+'</td><td>'+fmtMinutes(x.nightHours==null?null:x.nightHours*60)+' <small>('+esc(x.source)+')</small></td><td>'+n(x.napMinutes)+' min</td><td>'+fmtMinutes(x.shortfallMinutes)+'</td></tr>'+(x.notes?'<tr><td colspan="4" style="padding-bottom:10px;white-space:pre-wrap">'+esc(x.notes)+'</td></tr>':'');}).join('')+'</tbody></table></div></details>'+
+    '<details><summary style="cursor:pointer;padding:12px 0">Sleep settings &amp; naps</summary>'+
+    '<form data-sleep-target class="entry-form" style="display:block"><label class="strength-field">Nightly target (hours)<input name="targetHours" type="number" min="4" max="12" step="0.1" value="'+esc(log.targetHours)+'" required></label><p class="metricnote">Default 7.5 h. Changing this recalculates the displayed history; it does not measure your biological sleep need.</p><button class="entry-submit">Save target</button><p role="status"></p></form>'+
+    '<form data-sleep-day class="entry-form" style="display:block"><label class="strength-field">Date (night ending and naps on this day)<input name="date" type="date" max="'+esc(today)+'" value="'+esc(today)+'" required></label><div class="entry-fields"><label>Total nap minutes<input name="napMinutes" type="number" min="0" max="720" step="1" value="0" required></label><label>Night sleep correction (hours, optional)<input name="nightHours" type="number" min="0" max="24" step="0.01" placeholder="Use Garmin"></label></div><p class="metricnote">Enter actual sleep, not time in bed. Naps are manual totals for the selected date, counted once. A night correction replaces Garmin duration only in this estimate. Leave it blank to use Garmin; missing nights need a duration before naps can count. Today remains provisional until the day ends.</p><label class="strength-field">Daily context (optional)<textarea name="notes" rows="3" maxlength="2000" placeholder="Illness, stress, travel, late caffeine, interruptions, how rested you feel…"></textarea></label><p class="metricnote">Notes inform the context for AI advice; they do not add or subtract sleep minutes. To remove an entry, set naps to 0, clear the correction and notes, then save.</p><button class="entry-submit">Save day</button><p role="status"></p></form></details>';
+  var caption=document.createElement('p');caption.className='metricnote';caption.textContent='30-day trend of the rolling weekly shortfall. Dashed sections have fewer than 7 recorded days.';card.appendChild(caption);
+  card.appendChild(panel);
+  var dayForm=panel.querySelector('[data-sleep-day]');
+  function populate(){var entry=(log.entries||{})[dayForm.elements.date.value]||{};dayForm.elements.napMinutes.value=entry.napMinutes||0;dayForm.elements.nightHours.value=entry.nightHours==null?'':entry.nightHours;dayForm.elements.notes.value=entry.notes||'';}
+  dayForm.elements.date.addEventListener('change',populate);populate();
+  panel.querySelectorAll('form').forEach(function(form){form.addEventListener('submit',async function(event){
+    event.preventDefault();var button=form.querySelector('button'),status=form.querySelector('[role=status]');button.disabled=true;status.textContent='Saving…';
+    var payload={};new FormData(form).forEach(function(value,key){payload[key]=value;});
+    var saved=false;
+    try{
+      var response=await fetch('/api/sleep-log',{method:'POST',headers:{Authorization:'Bearer '+TOKEN,'Content-Type':'application/json'},body:JSON.stringify(payload),signal:AbortSignal.timeout(25000)});
+      var body=await response.json();if(!response.ok)throw new Error(body.error||'Could not save.');saved=true;log=body;status.textContent='Saved. Updating the chart…';
+      var refreshed=await fetch('/api/dashboard',{headers:{Authorization:'Bearer '+TOKEN},signal:AbortSignal.timeout(90000)});
+      if(!refreshed.ok)throw new Error('Refresh failed');render(await refreshed.json());
+      var updated=document.getElementById('sleep-debt-card');if(updated){updated.scrollIntoView({block:'center'});var message=document.createElement('p');message.setAttribute('role','status');message.textContent='Sleep changes saved.';updated.appendChild(message);}
+    }catch(error){status.textContent=saved?'Saved successfully. Refresh the dashboard to update the chart.':('Could not confirm save: '+error.message+'. Your input is still here; retrying replaces the same entry.');}
+    finally{button.disabled=false;}
+  });});
+}
+
 function drawDebt(debt){
   var svg=document.getElementById("debtc"),rows=(debt||{}).series||[];if(!svg||!rows.length)return;svg.innerHTML="";
   // The gutter holds durations such as "5h" or "30m", so it needs more room
   // than the numeric axes elsewhere on the page.
-  var W=1000,H=220,pL=72,pR=16,pT=18,pB=34,bands=(debt.bands||[30,120,300]);
+  var W=Math.max(280,svg.clientWidth||1000),H=220,pL=50,pR=16,pT=18,pB=34,bands=(debt.bands||[180,540,900]);
+  svg.setAttribute("viewBox","0 0 "+W+" "+H);
   var max=Math.max.apply(null,rows.map(function(x){return x.minutes;}).concat([bands[1]]))*1.2;
   function Y(v){return pT+(max-v)/max*(H-pT-pB)}
-  var shades=[["good",0,bands[0]],["warn",bands[0],bands[1]],["low",bands[1],max]];
-  shades.forEach(function(b){
-    if(b[1]>=max)return;
-    var r=document.createElementNS(ns,"rect");r.setAttribute("x",pL);r.setAttribute("width",W-pL-pR);
-    r.setAttribute("y",Y(Math.min(b[2],max)));r.setAttribute("height",Math.max(0,Y(b[1])-Y(Math.min(b[2],max))));
-    r.setAttribute("fill",css("--"+b[0]));r.setAttribute("opacity",".09");svg.appendChild(r);
+  function X(i){return pL+i*(W-pL-pR)/Math.max(1,rows.length-1)}
+  [false,true].forEach(function(partial){
+    var line='';
+    for(var i=1;i<rows.length;i++){
+      if(rows[i-1].minutes==null||rows[i].minutes==null)continue;
+      var incomplete=rows[i].recordedDays!=null&&(rows[i].recordedDays<7||rows[i-1].recordedDays<7);
+      if(incomplete!==partial)continue;
+      line+='M'+X(i-1).toFixed(1)+' '+Y(rows[i-1].minutes).toFixed(1)+'L'+X(i).toFixed(1)+' '+Y(rows[i].minutes).toFixed(1);
+    }
+    var path=document.createElementNS(ns,'path');path.setAttribute('d',line);path.setAttribute('fill','none');
+    path.setAttribute('stroke',css('--accent'));path.setAttribute('stroke-width',4);
+    if(partial)path.setAttribute('stroke-dasharray','7 6');svg.appendChild(path);
   });
-  var line=rows.map(function(x,i){return(i?"L":"M")+(pL+i*(W-pL-pR)/Math.max(1,rows.length-1)).toFixed(1)+" "+Y(x.minutes).toFixed(1);}).join(" ");
-  var p=document.createElementNS(ns,"path");p.setAttribute("d",line);p.setAttribute("fill","none");
-  p.setAttribute("stroke",css("--accent"));p.setAttribute("stroke-width",4);p.setAttribute("stroke-linejoin","round");svg.appendChild(p);
   rows.forEach(function(x,i){
+    if(x.minutes==null)return;
     var cx=pL+i*(W-pL-pR)/Math.max(1,rows.length-1),last=i===rows.length-1;
     var c=document.createElementNS(ns,"circle");c.setAttribute("cx",cx);c.setAttribute("cy",Y(x.minutes));
     c.setAttribute("r",last?8:4);c.setAttribute("fill",last?css("--accent"):css("--surface"));
     c.setAttribute("stroke",css("--accent"));c.setAttribute("stroke-width",3);svg.appendChild(c);
-    if(i%3===0||last){var t=document.createElementNS(ns,"text");t.setAttribute("x",cx);t.setAttribute("y",H-9);
+    if(W<500?(i===0||i===Math.floor((rows.length-1)/2)||last):((i%Math.ceil(rows.length/5)===0&&i<rows.length-3)||last)){var t=document.createElementNS(ns,"text");t.setAttribute("x",cx);t.setAttribute("y",H-9);
       t.setAttribute("text-anchor",last?"end":i===0?"start":"middle");t.setAttribute("font-size",16);
       t.setAttribute("fill",last?css("--accent"):css("--faint"));t.textContent=x.label;svg.appendChild(t);}
   });
@@ -3510,7 +3613,7 @@ function drawDebt(debt){
     t.setAttribute("text-anchor","end");t.setAttribute("font-size",15);t.setAttribute("fill",css("--faint"));
     t.textContent=v===0?"0":fmtMinutes(v);svg.appendChild(t);
   });
-  chartTip(svg,rows,function(x){return '<b>'+x.label+'</b><br>'+fmtMinutes(x.minutes)+' of sleep debt';});
+  chartTip(svg,rows,function(x){return '<b>'+esc(x.label)+'</b><br>'+fmtMinutes(x.minutes)+(debt.windowDays?' weekly shortfall':' of sleep debt')+(x.recordedDays!=null?'<br>'+x.recordedDays+'/7 days recorded':'');});
 }
 
 // Stacked nightly sleep stages, with awake time floated above the asleep total.

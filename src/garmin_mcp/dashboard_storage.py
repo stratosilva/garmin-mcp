@@ -111,6 +111,7 @@ class DashboardDatabase:
                         scores JSONB NOT NULL
                     )
                 """)
+                cursor.execute("CREATE TABLE IF NOT EXISTS dashboard_sleep_log (entry_key TEXT PRIMARY KEY, payload JSONB NOT NULL)")
             self._ready = True
 
     def _migration_done(self, cursor, key):
@@ -216,6 +217,25 @@ class DashboardDatabase:
             """, (row["timestamp"], value("weight_kg"), value("fat_pct"),
                    value("muscle_pct"), value("bone_pct"),
                    value("body_water_pct"), row["source"]))
+
+    def sleep_log(self):
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT entry_key, payload FROM dashboard_sleep_log")
+            rows = dict(cursor.fetchall())
+        return {"targetHours": rows.pop('settings', {}).get('targetHours', 7.5), "entries": rows}
+
+    def save_sleep_log(self, target, date, entry):
+        self.ensure_schema()
+        with self._connect() as connection, connection.cursor() as cursor:
+            rows = []
+            if target is not None:
+                rows.append(('settings', {'targetHours': target}))
+            if date is not None:
+                rows.append((date, entry))
+            for key, payload in rows:
+                cursor.execute("INSERT INTO dashboard_sleep_log (entry_key, payload) VALUES (%s, %s::jsonb) "
+                               "ON CONFLICT (entry_key) DO UPDATE SET payload = EXCLUDED.payload", (key, json.dumps(payload)))
 
     def injury_definitions(self):
         self.ensure_schema()
