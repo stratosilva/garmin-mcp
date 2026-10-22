@@ -254,7 +254,7 @@ class StrengthDashboardTests(unittest.TestCase):
     def test_recommendation_snapshot_includes_entered_strength_and_calories(self):
         strength = {
             "activities": [{
-                "name": "Strength",
+                "name": "Strength", "start": "2026-09-02T10:00:00",
                 "workingSets": 4,
                 "sets": [{"exercise": "Split Stance Anti-Rotation Cable Lift", "reps": 12}],
             }]
@@ -275,8 +275,8 @@ class StrengthDashboardTests(unittest.TestCase):
             "muscleVolume": {"weeks": [{"label": "Aug 31–Sep 6", "muscles": [{"key": "core", "total": 4}]}]},
             "sports": {"run": {"week": {"sessions": 2}, "recent": [{"name": "Easy run"}]}},
             "recent": [
-                {"sport": "run", "name": "Easy run", "min": 40},
-                {"sport": "other", "typeKey": "elliptical", "name": "Elliptical", "min": 25},
+                {"date": "2026-09-02", "sport": "run", "name": "Easy run", "min": 40},
+                {"date": "2026-09-02", "sport": "other", "typeKey": "elliptical", "name": "Elliptical", "min": 25},
                 {"sport": "other", "name": "Strength", "min": 45},
             ],
         })
@@ -284,7 +284,7 @@ class StrengthDashboardTests(unittest.TestCase):
         self.assertEqual(snapshot["energy_and_body"]["activity_calories"]["active"], 500)
         self.assertEqual(snapshot["energy_and_body"]["garmin_weight"]["kg"], 74.2)
         self.assertEqual(snapshot["fitness"]["fitness_level_trend_42d"][-1]["fitness"], 13.5)
-        self.assertEqual(snapshot["recovery"]["sleep_history_7d"][-1]["score"], 82)
+        self.assertEqual(snapshot["recovery"]["sleep_history_30d"][-1]["score"], 82)
         self.assertEqual(snapshot["fitness"]["training_load_trend_7d"][0]["load"], 40)
         self.assertEqual(snapshot["fitness"]["recent_cardio_workouts"][0]["name"], "Easy run")
         self.assertEqual(snapshot["fitness"]["recent_cardio_workouts"][1]["name"], "Elliptical")
