@@ -20,6 +20,16 @@ class InjurySettingsTests(unittest.TestCase):
     def save(self, definitions):
         return dashboard._save_injury_definitions({"definitions": definitions})
 
+    def test_default_history_retains_year_of_scores_and_notes(self):
+        old = (datetime.date.today() - datetime.timedelta(days=365)).isoformat()
+        self.path.write_text("date," + ",".join(self.fields) + ",notes\n" + old + ",2,3,4,Earlier symptoms\n")
+        records = dashboard._injury_measurements()["records"]
+        self.assertEqual(len(records), 367)
+        row = next(row for row in records if row["date"] == old)
+        self.assertEqual(row[self.fields[0]], 2)
+        self.assertEqual(row["notes"], "Earlier symptoms")
+        self.assertNotIn(self.fields[0], records[-1])
+
     def test_disable_edit_reenable_preserves_legacy_scores(self):
         self.path.write_text("date," + ",".join(self.fields) + "\n" + self.today + ",8,2,3\n")
         definitions = dashboard._injury_definitions()

@@ -2,6 +2,7 @@
 (function(){
   'use strict';
   const seed=JSON.parse(document.getElementById('demo-data').textContent);
+  seed.rehab={routines:[{id:"demo-rehab",name:"My mobility routine",enabled:true,injuryIds:[],exercises:[{name:"Gentle mobility",dose:"My usual routine"}]}],entries:[]};
   let data=structuredClone(seed), edits=0;
   const workouts={};
   const copy=x=>structuredClone(x);
@@ -12,6 +13,23 @@
     let body={};try{body=JSON.parse(options.body||'{}');}catch{return response({error:'Please check the entry.'},400);}
     if(path==='/api/dashboard')return response(copy(data));
     if(path==='/api/recommendation')return response({text:sampleAdvice+(edits?'\n\nYou have made local edits. This prepared example does not regenerate from those edits.':'')});
+    if(path==='/api/rehab'){
+      if(method==='POST'){
+        const routine=body.kind==='routine',list=routine?data.rehab.routines:data.rehab.entries;
+        const id=body.id||crypto.randomUUID(),index=list.findIndex(x=>x.id===id);
+        if(body.action==='delete'){if(index>=0)list.splice(index,1);}
+        else {
+          const value={...copy(body),id};
+          if(body.kind==='session'){
+            const template=data.rehab.routines.find(x=>x.id===body.routineId);
+            if(!template)return response({error:'Choose a routine.'},400);
+            value.routine=copy(index>=0?list[index].routine:template);
+          }
+          if(body.kind==='checkin')for(const key of ['pain','stiffness'])value[key]=body[key]===''||body[key]==null?null:Number(body[key]);
+          if(index>=0)list[index]=value;else list.push(value);
+        }edits++;
+      }return response(copy(data.rehab));
+    }
     if(path==='/api/injury-settings'){
       if(method==='POST'){
         const rows=body.definitions||[],names=new Set();

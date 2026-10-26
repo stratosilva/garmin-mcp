@@ -26,3 +26,33 @@ assert.match(ctx.injurySettingsRow(definitions[0]),/Disabled · history kept/);
 assert.doesNotMatch(ctx.injurySettingsRow(definitions[0]),/ checked/);
 assert.match(ctx.injurySettingsRow({name:'<unsafe>',enabled:true}),/&lt;unsafe>/);
 console.log('Injury chart visibility, re-enable, empty state, escaped labels and score prefill passed.');
+
+vm.runInContext(fn('injuryWindow'),ctx);
+let windowRows=ctx.injuryWindow(records,'2026-09-16',1);
+assert.equal(windowRows[0].date,'2026-08-16');assert.equal(windowRows.at(-1).date,'2026-09-16');
+assert.equal(windowRows.at(-2).knee,0);assert.equal(windowRows.at(-2).notes,records[0].notes);
+assert.equal(windowRows[0].knee,undefined);
+assert.equal(ctx.injuryWindow([],'2026-05-31',3)[0].date,'2026-02-28');
+assert.equal(ctx.injuryWindow([],'2024-05-31',3)[0].date,'2024-02-29');
+assert.equal(ctx.injuryWindow([],'2024-02-29',12)[0].date,'2023-02-28');
+assert.equal(ctx.injuryWindow([],'2025-02-28',12).length,367);
+for(const months of [1,3,6,12]){
+ const rows=ctx.injuryWindow(records,'2026-10-25',months);
+ ctx.drawInjuries(rows,definitions);
+ const ticks=svg.children.filter(x=>x.tag==='text'&&x.attributes.y===288);
+ assert.equal(ticks.length,5);assert.equal(ticks[0].attributes.x,44);assert.equal(ticks.at(-1).attributes.x,982);
+ assert.equal(rows.some(x=>x.notes),months>1);
+}
+console.log('Injury calendar ranges, leap years, missing data, notes and full-width ticks passed.');
+
+const tip={style:{},hidden:true};
+const hoverContext=vm.createContext({document:{getElementById:()=>tip}});
+vm.runInContext(fn('chartTip'),hoverContext);
+const hoverSvg={getBoundingClientRect:()=>({left:100,width:1000})};
+const yearRows=ctx.injuryWindow([],'2026-10-25',12);
+hoverContext.chartTip(hoverSvg,yearRows,row=>row.date,{left:0.044,width:0.938});
+for(const index of [0,10,100,yearRows.length-1]){
+ hoverSvg.onpointermove({clientX:100+44+index*938/(yearRows.length-1),clientY:200});
+ assert.equal(tip.innerHTML,yearRows[index].date);
+}
+console.log('Year-view tooltip dates align with plotted points.');

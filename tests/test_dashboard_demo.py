@@ -15,6 +15,7 @@ package=types.ModuleType(PKG);package.__path__=[str(ROOT)];sys.modules[PKG]=pack
 dashboard=types.ModuleType(PKG+'.dashboard')
 tree=ast.parse((ROOT/'dashboard.py').read_text(encoding='utf-8'))
 dashboard.PAGE_HTML=next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='PAGE_HTML' for t in n.targets))
+dashboard.PAGE_HTML=dashboard.PAGE_HTML.replace('load();\n</script>', (ROOT/'rehab_ui.js').read_text(encoding='utf-8')+'\nload();\n</script>')
 sys.modules[PKG+'.dashboard']=dashboard
 from _public_demo_test.demo import demo_html
 from _public_demo_test.demo_data import demo_data

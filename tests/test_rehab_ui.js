@@ -1,0 +1,14 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const code=fs.readFileSync('src/garmin_mcp/rehab_ui.js','utf8');
+const ctx=vm.createContext({Date});vm.runInContext(code,ctx);
+vm.runInContext('function injuryWindow(records,today,months){const end=new Date(today+"T00:00:00Z"),start=new Date(end);start.setUTCMonth(start.getUTCMonth()-months);return [{date:start.toISOString().slice(0,10)},{date:today}];}',ctx);
+const d={date:'2026-10-25',injuries:{definitions:[{id:'foot',name:'Foot',enabled:true}],records:[{date:'2026-10-24',foot:2,notes:'General note'}]},adviceHistory:{activities:[{date:'2026-10-24',name:'Treadmill',min:15,hr:119}]},rehab:{entries:[{id:'1',kind:'checkin',date:'2026-10-24',injuryId:'foot',timing:'before',pain:2},{id:'2',kind:'checkin',date:'2026-10-25',injuryId:'foot',timing:'morning',pain:3}]}};
+assert.match(ctx.rehabComparison(d)[0],/1 activity days.*1 higher/);
+assert.match(ctx.rehabComparison(d)[0],/2026-10-24/);
+d.rehab.entries[1].timing='general';assert.equal(ctx.rehabComparison(d).length,0);
+d.rehab.entries[1].timing='morning';d.rehab.entries[0].pain=null;assert.equal(ctx.rehabComparison(d).length,0);
+let days=ctx.rehabTimeline(d,1);assert.equal(days.length,2);assert.match(days[1].items[0].text,/Treadmill.*15 min.*119 bpm/);assert.match(days[1].items.at(-1).text,/timing unknown.*General note/);
+d.rehab.entries.push({id:'3',kind:'session',date:'2026-10-23',routine:{name:'Routine',exercises:[{name:'Hold',dose:'3 x 30s'}]},difficulty:'usual',notes:'Less stiff'});
+days=ctx.rehabTimeline(d,1);assert.match(days[2].items[0].text,/3 x 30s.*Less stiff/);
+assert.equal(days.flatMap(x=>x.items).filter(x=>x.kind==='activity').length,1);
+console.log('Rehab comparison timing, unknown scores, dated evidence and non-duplicated activity timeline passed.');
